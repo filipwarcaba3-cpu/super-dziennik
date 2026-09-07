@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Super dziennik 4.0 - lesson-centered school journal demo, stdlib only."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from http import cookies
+import sqlite3, hashlib, secrets, html, os, calendar
+from datetime import date, datetime, timedelta
+
+BASE=os.path.dirname(os.path.abspath(__file__)); DB=os.path.join(BASE,'edziennik.sqlite3')
+HOST='127.0.0.1'; PORT=8000; SESSIONS={}
+
+SCHEMA='''
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS schools(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,address TEXT DEFAULT '',email TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,school_id INTEGER,full_name TEXT NOT NULL,email TEXT DEFAULT '',phone TEXT DEFAULT '',active INTEGER DEFAULT 1,FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,name TEXT NOT NULL,year INTEGER DEFAULT 1,teacher_id INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS students(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,class_id INTEGER,guardian_name TEXT DEFAULT '',guardian_email TEXT DEFAULT '',guardian_phone TEXT DEFAULT '',FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(class_id) REFERENCES classes(id));
+CREATE TABLE IF NOT EXISTS subjects(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,name TEXT NOT NULL,short_name TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS enrollments(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,UNIQUE(student_id,subject_id),FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
+CREATE TABLE IF NOT EXISTS grades(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,weight REAL DEFAULT 1,category TEXT DEFAULT 'Ocena',comment TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,date TEXT NOT NULL,status TEXT NOT NULL,subject_id INTEGER,lesson_id INTEGER,comment TEXT DEFAULT '',FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
+CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,text TEXT NOT NULL,positive INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS excuses(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,date_from TEXT NOT NULL,date_to TEXT NOT NULL,reason TEXT DEFAULT '',status TEXT DEFAULT 'Oczekuje',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,target TEXT DEFAULT 'Wszyscy',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS meetings(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,title TEXT NOT NULL,date TEXT NOT NULL,location TEXT DEFAULT '',description TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY AUTOINCREMENT,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,weekday INTEGER NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,room TEXT DEFAULT '',FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS lesson_topics(id INTEGER PRIMARY KEY AUTOINCREMENT,lesson_id INTEGER NOT NULL,date TEXT NOT NULL,topic TEXT NOT NULL,UNIQUE(lesson_id,date),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,recipient_id INTEGER NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,read_at TEXT);
+'''
+
+def connect():
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
+def hpw(p): return hashlib.sha256(('edemo:'+p).encode()).hexdigest()
+def one(c,sql,args=()): return c.execute(sql,args).fetchone()
+def q(c,sql,args=()): return c.execute(sql,args).fetchall()
+def esc(x): return html.escape(str(x or ''))
+def opts(rows, value_key, label_key, selected=None):
+    return ''.join("<option value='%s'%s>%s</option>" % (r[value_key], ' selected' if selected is not None and r[value_key]==selected else '', esc(r[label_key])) for r in rows)
+def now(): return datetime.now().strftime('%Y-%m-%d %H:%M')
+
+def init():
+    c=connect(); c.executescript(SCHEMA)
+    # Migration for existing demo databases: bind attendance to a concrete lesson occurrence.
+    cols=[r['name'] for r in q(c,'PRAGMA table_info(attendance)')]
+    if 'lesson_id' not in cols: c.execute('ALTER TABLE attendance ADD COLUMN lesson_id INTEGER')
+    gcols=[r['name'] for r in q(c,'PRAGMA table_info(grades)')]
+    if 'lesson_id' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN lesson_id INTEGER')
+    if 'date' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN date TEXT')
+    ncols=[r['name'] for r in q(c,'PRAGMA table_info(notes)')]
+    if 'lesson_id' not in ncols: c.execute('ALTER TABLE notes ADD COLUMN lesson_id INTEGER')
+    if 'date' not in ncols: c.execute('ALTER TABLE notes ADD COLUMN date TEXT')
+    c.commit()
+    if one(c,'SELECT COUNT(*) n FROM schools')['n']==0:
+        c.execute("INSERT INTO schools(name,address,email) VALUES(?,?,?)",('Szkoła','ul. Szkolna 1','sekretariat@demo.local')); sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        def user(u,p,r,n,email=''):
+            c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(u,hpw(p),r,sid,n,email)); return c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        admin=user('admin','admin123','admin','Anna Administrator')
+        teacher=user('nauczyciel','demo123','teacher','Jan Kowalski','jan@demo.local')
+        teacher2=user('nauczyciel2','demo123','teacher','Maria Nowak','maria@demo.local')
+        su=user('uczen','demo123','student','Ola Nowak','ola@demo.local'); su2=user('uczen2','demo123','student','Piotr Zielinski')
+        c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(sid,'2A',2,teacher)); ca=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(sid,'3B',3,teacher2)); cb=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        c.execute('INSERT INTO students(user_id,class_id,guardian_name,guardian_email,guardian_phone) VALUES(?,?,?,?,?)',(su,ca,'Ewa Nowak','ewa@demo.local','500-100-200'))
+        c.execute('INSERT INTO students(user_id,class_id,guardian_name,guardian_email,guardian_phone) VALUES(?,?,?,?,?)',(su2,cb,'Tomasz Zielinski','tomasz@demo.local','501-200-300'))
+        for n,s in [('Matematyka','MAT'),('Jezyk polski','POL'),('Informatyka','INF'),('Historia','HIS'),('Biologia','BIO')]: c.execute('INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(sid,n,s))
+        st1=one(c,'SELECT id FROM students WHERE user_id=?',(su,))['id']; st2=one(c,'SELECT id FROM students WHERE user_id=?',(su2,))['id']
+        subs={r['short_name']:r['id'] for r in q(c,'SELECT id,short_name FROM subjects')}
+        for st in (st1,st2):
+            for sub in subs.values(): c.execute('INSERT OR IGNORE INTO enrollments(student_id,subject_id) VALUES(?,?)',(st,sub))
+        for st,sub,val,w,cat in [(st1,subs['MAT'],'5',2,'Sprawdzian'),(st1,subs['POL'],'4+',1,'Aktywnosc'),(st1,subs['INF'],'5-',1,'Projekt'),(st2,subs['MAT'],'3',2,'Kartkowka')]: c.execute('INSERT INTO grades(student_id,subject_id,teacher_id,value,weight,category) VALUES(?,?,?,?,?,?)',(st,sub,teacher,val,w,cat))
+        for st,d,s in [(st1,'2026-09-01','present'),(st1,'2026-09-02','late'),(st1,'2026-09-03','absent'),(st1,'2026-09-04','present'),(st2,'2026-09-01','present'),(st2,'2026-09-02','present')]: c.execute('INSERT INTO attendance(student_id,date,status) VALUES(?,?,?)',(st,d,s))
+        c.execute('INSERT INTO notes(student_id,teacher_id,text,positive) VALUES(?,?,?,?)',(st1,teacher,'Bardzo dobra praca na lekcji.',1))
+        c.execute('INSERT INTO excuses(student_id,date_from,date_to,reason) VALUES(?,?,?,?)',(st1,'2026-09-03','2026-09-03','Wizyta u lekarza'))
+        c.execute('INSERT INTO announcements(school_id,title,body,target) VALUES(?,?,?,?)',(sid,'Nowy rok szkolny','Witamy uczniów. Plan lekcji jest już dostępny.','Wszyscy'))
+        c.execute('INSERT INTO announcements(school_id,title,body,target) VALUES(?,?,?,?)',(sid,'Konkurs matematyczny','Zapisy do piątku w sekretariacie.','Uczniowie'))
+        c.execute('INSERT INTO meetings(school_id,title,date,location,description) VALUES(?,?,?,?,?)',(sid,'Zebranie z rodzicami','2026-09-15 17:00','Sala 12','Spotkanie organizacyjne.'))
+        for wd,sub,teach,stt,en,room in [(1,subs['MAT'],teacher,'08:00','08:45','12'),(1,subs['POL'],teacher,'08:55','09:40','18'),(2,subs['INF'],teacher,'10:00','10:45','21'),(3,subs['MAT'],teacher,'09:00','09:45','12')]: c.execute('INSERT INTO lessons(class_id,subject_id,teacher_id,weekday,start_time,end_time,room) VALUES(?,?,?,?,?,?,?)',(ca,sub,teach,wd,stt,en,room))
+        c.commit()
+    c.close()
+
+CSS='''
+:root{--bg:#f5f7fb;--panel:#fff;--ink:#182235;--muted:#718096;--line:#e7eaf0;--brand:#4f46e5;--brand2:#7c3aed;--dark:#111827;--green:#059669;--red:#dc2626;--amber:#d97706;--orange:#f97316;--burgundy:#7f1d3b;--shadow:0 12px 35px rgba(31,41,55,.07)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}.app{display:flex;min-height:100vh}.side{width:250px;background:linear-gradient(180deg,#111827,#1f2937);color:#e5e7eb;position:fixed;inset:0 auto 0 0;padding:22px 15px;display:flex;flex-direction:column;z-index:5}.logo{font-size:20px;font-weight:800;padding:8px 12px 24px}.logo span{color:#a5b4fc}.who{background:#ffffff0b;border:1px solid #ffffff14;border-radius:14px;padding:12px;margin-bottom:18px}.who b{display:block;color:#fff}.who small{color:#9ca3af}.nav a{display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;padding:10px 12px;margin:3px 0;text-decoration:none;border-radius:10px;color:#cbd5e1;cursor:pointer;user-select:none}.nav a span{width:22px;min-width:22px;text-align:center;pointer-events:none}.nav a>*{pointer-events:none}.nav .nav-label{display:block;flex:1}.nav a:hover,.nav a.active{background:#ffffff14;color:#fff}.side .logout{margin-top:auto}.logout-link{background:#ffffff08;border:1px solid #ffffff12}.logout-link:hover{background:#dc262633!important;color:#fff!important}.main{margin-left:250px;width:calc(100% - 250px)}.top{height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;padding:0 30px;position:sticky;top:0;z-index:3}.top h2{font-size:18px;margin:0}.content{max-width:1450px;margin:0 auto;padding:28px}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:15px;margin-bottom:22px}.hero h1{font-size:30px;line-height:1.1;margin:0 0 5px}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.col12{grid-column:span 12}.col8{grid-column:span 8}.col6{grid-column:span 6}.col4{grid-column:span 4}.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:19px;box-shadow:var(--shadow)}.card h3{margin:0 0 12px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:18px;border:1px solid var(--line);border-radius:16px;background:#fff}.stat .num{font-size:28px;font-weight:800;margin-top:5px}.stat .label{color:var(--muted)}.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:10px;background:var(--brand);color:#fff;text-decoration:none;padding:9px 13px;cursor:pointer;font-weight:650}.btn.gray{background:#eef2f7;color:#374151}.btn.red{background:var(--red)}.btn.green{background:var(--green)}.btn.amber{background:var(--amber)}.btn.sm{padding:6px 9px;font-size:12px}.form{display:grid;gap:10px}.form input,.form select,.form textarea{width:100%;padding:10px 11px;border:1px solid #d8dde7;border-radius:10px;background:#fff;font:inherit}.form textarea{min-height:95px}.form .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}.table th{font-size:12px;text-transform:uppercase;color:var(--muted);letter-spacing:.03em}.badge{display:inline-block;padding:4px 8px;border-radius:99px;background:#eef2ff;color:#3730a3;font-size:12px}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.notice{padding:12px 14px;border-radius:12px;background:#eef2ff;margin-bottom:10px}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.cal-head{font-size:12px;color:var(--muted);text-align:center;font-weight:700;padding:5px}.day{min-height:95px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px}.day.mutedday{background:#fafafa;color:#b0b7c3}.day.today{outline:2px solid #818cf8}.daynum{font-weight:800}.event{display:block;margin-top:5px;padding:4px 6px;border-radius:7px;background:#eef2ff;color:#3730a3;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.schedule{display:grid;grid-template-columns:70px repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);overflow:hidden;border-radius:14px}.schedule>div{background:#fff;padding:9px;min-height:58px}.schedule .head{font-weight:800;text-align:center;background:#f8fafc}.lesson{display:block;border-left:4px solid var(--brand);border-radius:7px;background:#f4f3ff!important;text-decoration:none;color:inherit}.lesson small{display:block;margin-top:5px;color:var(--muted)}.lesson-present{background:#ecfdf5!important;border-left-color:var(--green)}.lesson-absent{background:#fef2f2!important;border-left-color:var(--red)}.lesson-late{background:#fffbeb!important;border-left-color:var(--amber)}.lesson-excused{background:#eef2ff!important;border-left-color:var(--brand)}.lesson-late-excused{background:#fff7ed!important;border-left-color:var(--orange)}.lesson-excused-present{background:#fdf2f8!important;border-left-color:var(--burgundy)}.grade-board{display:flex;flex-wrap:wrap;gap:16px;align-items:stretch}.grade-subject{flex:1 1 220px;min-width:220px;background:#fff;border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}.grade-subject h3{margin:0 0 4px}.grade-count{font-size:12px;color:var(--muted);margin-bottom:12px}.grade-pills{display:flex;flex-wrap:wrap;gap:9px}.grade-pill{min-width:54px;padding:10px 12px;border-radius:12px;background:#f3f4f6;text-align:center}.grade-pill b{font-size:20px;display:block}.note-row{width:100%;margin-bottom:12px;padding:16px 18px;border-radius:14px;border:1px solid var(--line);background:#fff}.note-title{font-weight:800}.note-negative{border-left:5px solid var(--red)}.note-negative .note-text{color:var(--red)}.note-positive{border-left:5px solid var(--green)}.note-positive .note-text{color:var(--green)}.status-badge-present{background:#d1fae5;color:#065f46}.status-badge-absent{background:#fee2e2;color:#991b1b}.status-badge-late{background:#fef3c7;color:#92400e}.status-badge-late_excused{background:#ffedd5;color:#9a3412}.status-badge-excused_present{background:#fce7f3;color:#831843}.present-b{background:#d1fae5;color:#065f46}.absent-b{background:#fee2e2;color:#991b1b}.late-b{background:#fef3c7;color:#92400e}.status-chip{display:inline-block;padding:8px 12px;border-radius:999px;font-weight:700}.status-chip.present{background:#d1fae5;color:#065f46}.status-chip.absent{background:#fee2e2;color:#991b1b}.status-chip.late{background:#fef3c7;color:#92400e}.status-chip.excused{background:#e0e7ff;color:#3730a3}.status-chip.late_excused{background:#ffedd5;color:#9a3412}.status-chip.excused_present{background:#fce7f3;color:#831843}.login{min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top left,#e0e7ff,#f8fafc 55%)}.loginbox{width:min(430px,92vw);background:#fff;padding:30px;border:1px solid var(--line);border-radius:22px;box-shadow:0 20px 60px #0001}.loginbox h1{margin-top:0}.pillrow{display:flex;gap:8px;flex-wrap:wrap}.empty{padding:28px;text-align:center;color:var(--muted)}.mobile{display:none}
+@media(max-width:1000px){.side{width:210px}.main{margin-left:210px;width:calc(100% - 210px)}.stats{grid-template-columns:repeat(2,1fr)}.col8,.col6,.col4{grid-column:span 12}}
+@media(max-width:700px){.side{display:none}.main{margin-left:0;width:100%}.mobile{display:block}.top{padding:0 16px}.content{padding:18px}.stats{grid-template-columns:1fr 1fr}.schedule{grid-template-columns:55px repeat(5,120px);overflow:auto}.calendar{grid-template-columns:repeat(2,1fr)}}
+'''
+
+def nav_items(role,path):
+    base=[('/dashboard','Pulpit','▦'),('/schedule','Plan tygodniowy','▤'),('/calendar','Kalendarz','◷'),('/attendance','Frekwencja','✓'),('/grades','Oceny' if role=='student' else 'Oceny i średnie','★'),('/announcements','Komunikaty','!'),('/messages','Wiadomości','✉')]
+    if role=='student': base.insert(5,('/my-notes','Uwagi i pochwały','✦'))
+    if role in ('admin','teacher'):
+        base.insert(1,('/classes','Klasy','♟'))
+    if role=='admin': base += [('/lessons','Edytor planu','✎'),('/subjects','Przedmioty','A'),('/admins','Administratorzy','⚙')]
+    elif role=='teacher': base += [('/lessons','Plan lekcji','✎')]
+    return ''.join(f"<a class=\"{'active' if path==p else ''}\" href=\"{p}\" aria-label=\"{label}\"><span>{ico}</span><span class=\"nav-label\">{label}</span></a>" for p,label,ico in base)
+
+def layout(title,body,u=None,path=''):
+    if not u: return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title><style>{CSS}</style></head><body>{body}</body></html>"
+    role={'admin':'Administrator','teacher':'Nauczyciel','student':'Uczeń'}[u['role']]
+    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)} · Super dziennik 4.0</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.0</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><section class='content'>{body}</section></main></div></body></html>"
+def login_page(msg=''):
+    body=f"<div class='login'><div class='loginbox'><div class='logo'>Super dziennik <span>4.0</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
+    return layout('Logowanie',body)
+
+def student_id(c,u): return one(c,'SELECT id FROM students WHERE user_id=?',(u['id'],))['id']
+def class_for(c,u): return one(c,'SELECT cl.* FROM students st JOIN classes cl ON cl.id=st.class_id WHERE st.user_id=?',(u['id'],))
+def can_manage_student(c,u,sid):
+    if u['role']=='admin': return True
+    if u['role']!='teacher': return False
+    return bool(one(c,'SELECT st.id FROM students st JOIN classes cl ON cl.id=st.class_id WHERE st.id=? AND cl.teacher_id=? AND cl.school_id=?',(sid,u['id'],u['school_id'])))
+def avg(c,student_id,subject_id=None):
+    sql='SELECT value,weight FROM grades WHERE student_id=?'; args=[student_id]
+    if subject_id: sql+=' AND subject_id=?'; args.append(subject_id)
+    rows=q(c,sql,args); vals=[]
+    for r in rows:
+        try:
+            s=str(r['value']).replace(',','.'); mod={'6':6,'5+':5.5,'5':5,'5-':4.75,'4+':4.5,'4':4,'4-':3.75,'3+':3.5,'3':3,'3-':2.75,'2+':2.5,'2':2,'2-':1.75,'1':1}.get(s,float(s))
+            vals.append((mod,float(r['weight'] or 1)))
+        except: pass
+    return round(sum(v*w for v,w in vals)/sum(w for v,w in vals),2) if vals else None
+
+def dash(u,c):
+    if u['role']=='student':
+        sid=student_id(c,u); cls=class_for(c,u); g=q(c,'SELECT g.*,s.name subject FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY g.id DESC LIMIT 8',(sid,)); a=q(c,'SELECT status,COUNT(*) n FROM attendance WHERE student_id=? GROUP BY status',(sid,)); ann=q(c,'SELECT * FROM announcements WHERE school_id=? ORDER BY id DESC LIMIT 3',(u['school_id'],));
+        counts={r['status']:r['n'] for r in a}; total=sum(counts.values()); present=counts.get('present',0); late=counts.get('late',0); rate=round((present+late)/total*100) if total else 0
+        body=f"<div class='hero'><div><h1>Dzień dobry, {esc(u['full_name'].split()[0])} 👋</h1><div class='muted'>Klasa {esc(cls['name'] if cls else '—')} · Twój przegląd dnia</div></div></div><div class='stats'><div class='stat'><div class='label'>Średnia</div><div class='num'>{avg(c,sid) or '—'}</div></div><div class='stat'><div class='label'>Frekwencja</div><div class='num'>{rate}%</div></div><div class='stat'><div class='label'>Nieobecności</div><div class='num'>{counts.get('absent',0)}</div></div><div class='stat'><div class='label'>Spóźnienia</div><div class='num'>{counts.get('late',0)}</div></div></div><div class='grid' style='margin-top:16px'><div class='card col8'><h3>Ostatnie oceny</h3>{grade_table(g) if g else '<div class=empty>Brak ocen.</div>'}</div><div class='card col4'><h3>Komunikaty</h3>{''.join(f"<div class=notice><b>{esc(x['title'])}</b><br>{esc(x['body'])}</div>" for x in ann) or '<div class=empty>Brak komunikatów.</div>'}</div></div>"
+    elif u['role']=='teacher':
+        students=q(c,'SELECT st.id,u.full_name,cl.name class_name FROM students st JOIN users u ON u.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE u.school_id=? ORDER BY cl.name,u.full_name',(u['school_id'],)); classes=q(c,'SELECT cl.*,u.full_name teacher FROM classes cl LEFT JOIN users u ON u.id=cl.teacher_id WHERE cl.school_id=?',(u['school_id'],));
+        body=f"<div class='hero'><div><h1>Panel nauczyciela</h1><div class='muted'>Szybki dostęp do klas, frekwencji, ocen i planu.</div></div><a class='btn' href='/lessons'>Edytuj plan</a></div><div class='stats'><div class='stat'><div class='label'>Uczniowie</div><div class='num'>{len(students)}</div></div><div class='stat'><div class='label'>Klasy</div><div class='num'>{len(classes)}</div></div><div class='stat'><div class='label'>Dzisiejsze lekcje</div><div class='num'>{len(q(c,'SELECT id FROM lessons WHERE teacher_id=? AND weekday=?',(u['id'],datetime.now().isoweekday())))}</div></div><div class='stat'><div class='label'>Oczekujące usprawiedliwienia</div><div class='num'>{one(c,"SELECT COUNT(*) n FROM excuses e JOIN students st ON st.id=e.student_id JOIN users us ON us.id=st.user_id WHERE us.school_id=? AND e.status='Oczekuje'",(u['school_id'],))['n']}</div></div></div><div class='grid' style='margin-top:16px'><div class='card col8'><h3>Uczniowie</h3>{student_table(students,teacher=True)}</div><div class='card col4'><h3>Skróty</h3><p><a class='btn' href='/grades'>Dodaj ocenę</a></p><p><a class='btn gray' href='/attendance'>Wpisz frekwencję</a></p><p><a class='btn gray' href='/classes'>Zobacz klasy</a></p></div></div>"
+    else:
+        body=admin_dashboard_body(c,u)
+    return layout('Pulpit',body,u,'/dashboard')
+
+def grade_table(rows, can_edit=False):
+    head='<table class=table><tr><th>Przedmiot</th><th>Ocena</th><th>Waga</th><th>Kategoria</th><th></th></tr>'
+    out=[]
+    for r in rows:
+        action=(f"<a class='btn sm gray' href='/grade/{r['id']}/edit'>Edytuj</a> <form method=post action='/grade/{r['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć ocenę?')\"><button class='btn sm red'>Usuń</button></form>" if can_edit else '')
+        out.append(f"<tr><td>{esc(r['subject'])}</td><td><b>{esc(r['value'])}</b></td><td>{esc(r['weight'])}</td><td>{esc(r['category'])}</td><td>{action}</td></tr>")
+    return head+''.join(out)+'</table>'
+
+def grade_subject_board(rows, can_edit=False):
+    groups={}
+    for r in rows:
+        groups.setdefault(r['subject'],[]).append(r)
+    blocks=[]
+    for subject, items in groups.items():
+        pills=[]
+        for r in items:
+            action=(f"<div style='margin-top:6px'><a class='btn sm gray' href='/grade/{r['id']}/edit'>Edytuj</a> <form method=post action='/grade/{r['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć ocenę?')\"><button class='btn sm red'>Usuń</button></form></div>" if can_edit else '')
+            pills.append(f"<div class='grade-pill'><b>{esc(r['value'])}</b><span class='muted'>waga {esc(r['weight'])}</span><br><span class='muted'>{esc(r['category'])}</span>{action}</div>")
+        blocks.append(f"<div class='grade-subject' style='flex-grow:{max(1,len(items))}'><h3>{esc(subject)}</h3><div class='grade-count'>{len(items)} {'ocena' if len(items)==1 else 'oceny' if len(items) in (2,3,4) else 'ocen'}</div><div class='grade-pills'>{''.join(pills)}</div></div>")
+    return "<div class='grade-board'>"+''.join(blocks)+"</div>" if blocks else '<div class=empty>Brak ocen.</div>'
+
+def student_table(rows,teacher=False):
+    return '<table class=table><tr><th>Uczeń</th><th>Klasa</th><th></th></tr>'+''.join(f"<tr><td><b>{esc(r['full_name'])}</b></td><td>{esc(r['class_name'])}</td><td><a class='btn sm gray' href='/student/{r['id']}'>Profil</a></td></tr>" for r in rows)+'</table>'
+
+def admin_dashboard_body(c,u):
+    schools=q(c,'SELECT * FROM schools'); teachers=q(c,"SELECT * FROM users WHERE role='teacher' AND school_id=?",(u['school_id'],)); students=q(c,'SELECT st.id,u.full_name,cl.name class_name FROM students st JOIN users u ON u.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE u.school_id=?',(u['school_id'],)); classes=q(c,'SELECT cl.*,u.full_name teacher FROM classes cl LEFT JOIN users u ON u.id=cl.teacher_id WHERE cl.school_id=?',(u['school_id'],))
+    return f"<div class='hero'><div><h1>Panel administratora</h1><div class='muted'>Zarządzanie szkołą i strukturą e-dziennika.</div></div></div><div class='stats'><div class=stat><div class=label>Uczniowie</div><div class=num>{len(students)}</div></div><div class=stat><div class=label>Nauczyciele</div><div class=num>{len(teachers)}</div></div><div class=stat><div class=label>Klasy</div><div class=num>{len(classes)}</div></div><div class=stat><div class=label>Szkoła</div><div class=num>1</div></div></div><div class='grid' style='margin-top:16px'><div class='card col8'><h3>Klasy</h3>{''.join(f"<p><b>{esc(x['name'])}</b> · wychowawca: {esc(x['teacher'])}</p>" for x in classes)}</div><div class='card col4'><h3>Administracja</h3><p><a class=btn href='/classes'>Zarządzaj klasami</a></p><p><a class='btn gray' href='/lessons'>Edytuj plan lekcji</a></p><p><a class='btn gray' href='/announcements'>Komunikaty szkoły</a></p></div></div>"
+
+def classes_page(u,c):
+    classes=q(c,'SELECT cl.*,u.full_name teacher,(SELECT COUNT(*) FROM students st WHERE st.class_id=cl.id) n FROM classes cl LEFT JOIN users u ON u.id=cl.teacher_id WHERE cl.school_id=? ORDER BY cl.name',(u['school_id'],))
+    cards=[]
+    for cl in classes:
+        sts=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE st.class_id=? ORDER BY u.full_name',(cl['id'],))
+        delete_class=f"<form method=post action='/class/{cl['id']}/delete' onsubmit=\"return confirm('Usunąć klasę? Uczniowie i powiązane dane zostaną usunięte.')\"><button class='btn sm red'>Usuń klasę</button></form>" if u['role']=='admin' else ''
+        cards.append(f"<div class=card><div style='display:flex;justify-content:space-between;align-items:flex-start;gap:10px'><div><h3>{esc(cl['name'])}</h3><p class=muted>Rocznik {cl['year']} · wychowawca: {esc(cl['teacher'])}</p></div>{delete_class}</div><p><b>{cl['n']}</b> uczniów</p>{''.join(f"<div style='padding:7px 0;border-top:1px solid var(--line)'><a href='/student/{s['id']}'>{esc(s['full_name'])}</a></div>" for s in sts) or '<div class=empty>Brak uczniów.</div>'}</div>")
+    add=''
+    if u['role']=='admin':
+        teachers=q(c,"SELECT id,full_name FROM users WHERE role='teacher' AND school_id=?",(u['school_id'],)); add="<div class='card col6'><h3>Dodaj klasę</h3><form class=form method=post action=/class><div class=row><input name=name placeholder='np. 1A' required><input name=year type=number min=1 max=8 value=1></div><select name=teacher_id><option value=''>Wychowawca</option>"+opts(teachers,'id','full_name')+"</select><button class=btn>Utwórz klasę</button></form></div><div class='card col6'><h3>Dodaj konto</h3><form class=form method=post action=/user><div class=row><input name=full_name placeholder='Imię i nazwisko' required><input name=username placeholder='Login' required></div><div class=row><input name=password value='demo123' placeholder='Hasło' required><select name=role><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option></select></div><select name=class_id>"+opts(classes,'id','name')+"</select><input name=email placeholder='E-mail'><button class=btn>Utwórz konto</button></form></div>"
+    return layout('Klasy',f"<div class=hero><div><h1>Klasy</h1><div class=muted>Struktura szkoły i lista uczniów.</div></div></div><div class=grid>{add}{''.join(f'<div class=col4>{x}</div>' for x in cards)}</div>",u,'/classes')
+
+def student_page(u,c,sid):
+    st=one(c,'SELECT st.*,u.full_name,u.email,u.school_id,cl.name class_name FROM students st JOIN users u ON u.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE st.id=?',(sid,))
+    if not st: return layout('Nie znaleziono','<div class=card>Nie znaleziono ucznia.</div>',u)
+    if u['role']=='student' and st['user_id'] != u['id']:
+        return layout('403','<div class=card><h1>403</h1><p>Uczeń może wyświetlić wyłącznie własny profil.</p></div>',u)
+    if u['role'] in ('admin','teacher') and st['school_id'] != u['school_id']:
+        return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień do tego ucznia.</p></div>',u)
+    grades=q(c,'SELECT g.*,s.name subject FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY g.id DESC',(sid,)); att=q(c,'SELECT a.*,s.name subject FROM attendance a LEFT JOIN subjects s ON s.id=a.subject_id WHERE a.student_id=? ORDER BY a.date DESC',(sid,)); notes=q(c,'SELECT n.*,u.full_name teacher FROM notes n JOIN users u ON u.id=n.teacher_id WHERE n.student_id=? ORDER BY n.id DESC',(sid,)); can_manage=can_manage_student(c,u,sid);
+    avgall=avg(c,sid); total=len(att); present=sum(1 for x in att if x['status']=='present'); late=sum(1 for x in att if x['status'] in ('late','late_excused')); rate=round((present+late)/total*100) if total else 0
+    delete=f"<form method=post action='/student/{sid}/delete' onsubmit=\"return confirm('Usunąć ucznia i powiązane dane?')\"><button class='btn red'>Usuń ucznia</button></form>" if u['role']=='admin' else ''
+    manage_forms=(f"<div class='card col12'><h3>Zarządzanie uczniem</h3><div class=row><a class='btn' href='/grades?student_id={sid}'>Dodaj ocenę</a><a class='btn gray' href='/attendance?student_id={sid}'>Dodaj frekwencję</a></div></div>" if can_manage else '')
+    password_manage=(f"<div class='card col12'><h3>Hasło użytkownika</h3><p class=muted>Ze względów bezpieczeństwa administrator nie może odczytać starego hasła. Może natomiast ustawić nowe hasło dla tego konta.</p><form class=form method=post action='/student/{sid}/password'><input type=password name=new_password placeholder='Nowe hasło' minlength=4 required><input type=password name=confirm_password placeholder='Powtórz nowe hasło' minlength=4 required><button class='btn amber'>Ustaw nowe hasło</button></form></div>" if u['role']=='admin' else '')
+    notes_html=''.join(f"<div class='note-row {'note-positive' if n['positive'] else 'note-negative'}'><div class='note-title'>{'Pochwała' if n['positive'] else 'Uwaga'} · {esc(n['teacher'])}</div><div class='note-text'>{esc(n['text'])}</div><div class='muted' style='margin-top:6px'>{esc(n['date'] or n['created_at'])}</div>{(f"<div style='margin-top:10px'><a class='btn sm gray' href='/note/{n['id']}/edit'>Edytuj</a> <form method=post action='/note/{n['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć wpis?')\"><button class='btn sm red'>Usuń</button></form></div>" if (u['role']=='admin' or n['teacher_id']==u['id']) else '')}</div>" for n in notes) or '<div class=empty>Brak pochwał i uwag.</div>'
+    note_form=(f"<div class='card col12'><h3>Dodaj pochwałę lub uwagę</h3><form class=form method=post action=/note><input type=hidden name=student_id value='{sid}'><textarea name=text placeholder='Treść wpisu' required></textarea><select name=positive><option value=1>Pochwała</option><option value=0>Uwaga</option></select><button class=btn>Dodaj wpis</button></form></div>" if can_manage else '')
+    return layout('Profil ucznia',f"<div class=hero><div><h1>{esc(st['full_name'])}</h1><div class=muted>Klasa {esc(st['class_name'])} · średnia {avgall or '—'} · frekwencja {rate}%</div></div>{delete}</div><div class=grid>{manage_forms}{password_manage}<div class='card col8'><h3>Oceny</h3>{grade_subject_board(grades,can_manage)}</div><div class='card col4'><h3>Frekwencja</h3><p class=stat>{rate}%</p><p>Obecności: {present} · wszystkie wpisy: {total}</p><h3>Kontakt</h3><p>{esc(st['email'])}</p></div><div class='card col12'><h3>Historia frekwencji</h3>{attendance_table(att,can_manage)}</div><div class='card col12'><h3>Pochwały i uwagi</h3>{notes_html}</div>{note_form}</div>",u,'/classes')
+
+def attendance_table(rows, can_edit=False):
+    lab={'present':'Obecny','absent':'Nieobecny','late':'Spóźnienie','excused':'Usprawiedliwiona nieobecność','late_excused':'Spóźnienie usprawiedliwione','excused_present':'Nieobecność usprawiedliwiona'}
+    head='<table class=table><tr><th>Data</th><th>Status</th><th>Przedmiot</th><th>Komentarz</th><th></th></tr>'
+    out=[]
+    for r in rows:
+        action=(f"<a class='btn sm gray' href='/attendance/{r['id']}/edit'>Edytuj</a> <form method=post action='/attendance/{r['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć wpis frekwencji?')\"><button class='btn sm red'>Usuń</button></form>" if can_edit else '')
+        out.append(f"<tr><td>{esc(r['date'])}</td><td><span class='badge status-badge-{esc(r['status'])}'>{lab.get(r['status'],r['status'])}</span></td><td>{esc(r['subject'])}</td><td>{esc(r['comment'])}</td><td>{action}</td></tr>")
+    return head+''.join(out)+'</table>'
+
+def grades_page(u,c):
+    if u['role']=='student':
+        sid=student_id(c,u); rows=q(c,'SELECT g.*,s.name subject FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY s.name,g.id DESC',(sid,)); subjects=q(c,'SELECT s.id,s.name FROM subjects s JOIN enrollments e ON e.subject_id=s.id WHERE e.student_id=?',(sid,)); form=''
+    else:
+        rows=q(c,'SELECT g.*,s.name subject,u.full_name student,st.id student_id FROM grades g JOIN subjects s ON s.id=g.subject_id JOIN students st ON st.id=g.student_id JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY g.id DESC',(u['school_id'],)); subjects=q(c,'SELECT * FROM subjects WHERE school_id=?',(u['school_id'],)); students=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY u.full_name',(u['school_id'],))
+        form="<div class='card col12'><h3>Dodaj ocenę</h3><form class=form method=post action=/grade><div class=row><select name=student_id required>"+opts(students,'id','full_name')+"</select><select name=subject_id required>"+opts(subjects,'id','name')+"</select></div><div class=row><input name=value placeholder='Ocena, np. 5' required><input name=weight type=number step=.5 value=1 min=.5></div><div class=row><input name=category value='Ocena'><input name=comment placeholder='Komentarz'></div><button class=btn>Dodaj ocenę</button></form></div>"
+    bysub=''
+    if u['role']=='student': bysub="<div class='card' style='margin-bottom:16px'><h3>Oceny według przedmiotów</h3>"+grade_subject_board(rows,False)+"</div>"
+    all_html=("<div class=card><h3>Wszystkie oceny</h3>"+grade_table(rows, u['role']=='admin')+"</div>") if u['role']!='student' else ''
+    return layout('Oceny i średnie',"<div class=hero><div><h1>Oceny i średnie</h1><div class=muted>Średnie ważone i szczegółowa lista ocen.</div></div></div>"+form+bysub+all_html,u,'/grades')
+
+def attendance_page(u,c):
+    if u['role']=='student':
+        sid=student_id(c,u); rows=q(c,'SELECT a.*,s.name subject FROM attendance a LEFT JOIN subjects s ON s.id=a.subject_id WHERE a.student_id=? ORDER BY a.date DESC',(sid,)); form=''
+    else:
+        rows=q(c,'SELECT a.*,s.name subject,u.full_name student,a.student_id FROM attendance a LEFT JOIN subjects s ON s.id=a.subject_id JOIN students st ON st.id=a.student_id JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY a.date DESC,a.id DESC',(u['school_id'],)); students=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY u.full_name',(u['school_id'],)); subjects=q(c,'SELECT * FROM subjects WHERE school_id=?',(u['school_id'],)); form="<div class='card col12'><h3>Wpisz frekwencję</h3><form class=form method=post action=/attendance><div class=row><select name=student_id required>"+opts(students,'id','full_name')+"</select><input name=date type=date value='"+date.today().isoformat()+"'></div><div class=row><select name=status><option value=present>Obecny</option><option value=absent>Nieobecny</option><option value=late>Spóźnienie</option><option value=excused>Usprawiedliwiona nieobecność</option><option value=late_excused>Spóźnienie usprawiedliwione</option><option value=excused_present>Nieobecność usprawiedliwiona</option></select><select name=subject_id><option value=''>Cały dzień</option>"+opts(subjects,'id','name')+"</select></div><input name=comment placeholder='Komentarz'><button class=btn>Dodaj wpis</button></form></div>"
+    total=len(rows); p=sum(x['status']=='present' for x in rows); ab=sum(x['status']=='absent' for x in rows); la=sum(x['status'] in ('late','late_excused') for x in rows); rate=round((p+la)/total*100) if total else 0
+    stats="<div class=stats><div class=stat><div class=label>Frekwencja</div><div class=num>%s%%</div></div><div class=stat><div class=label>Obecności</div><div class=num>%s</div></div><div class=stat><div class=label>Nieobecności</div><div class=num>%s</div></div><div class=stat><div class=label>Spóźnienia</div><div class=num>%s</div></div></div>"%(rate,p,ab,la)
+    return layout('Frekwencja',"<div class=hero><div><h1>Frekwencja</h1><div class=muted>Pełna historia obecności, nieobecności i spóźnień.</div></div></div>"+stats+"<div class=grid style='margin-top:16px'>"+form+"<div class=card col12><h3>Historia</h3>"+attendance_table(rows, u['role']=='admin')+"</div></div>",u,'/attendance')
+
+def edit_grade(u,c,gid):
+    g=one(c,'SELECT g.*,st.id student_id,cl.teacher_id FROM grades g JOIN students st ON st.id=g.student_id JOIN classes cl ON cl.id=st.class_id JOIN users us ON us.id=st.user_id WHERE g.id=? AND us.school_id=?',(gid,u['school_id']))
+    if not g or not can_manage_student(c,u,g['student_id']): return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień do zmiany tej oceny.</p></div>',u)
+    subjects=q(c,'SELECT * FROM subjects WHERE school_id=? ORDER BY name',(u['school_id'],)); body=f"<div class=hero><div><h1>Edytuj ocenę</h1><div class=muted>Zmiana oceny ucznia.</div></div></div><div class=card><form class=form method=post action='/grade/{gid}/edit'><select name=subject_id>"+opts(subjects,'id','name',g['subject_id'])+f"</select><div class=row><input name=value value='{esc(g['value'])}' required><input name=weight type=number step=.5 min=.5 value='{esc(g['weight'])}'></div><div class=row><input name=category value='{esc(g['category'])}'><input name=comment value='{esc(g['comment'])}'></div><button class=btn>Zapisz zmiany</button></form></div>"
+    return layout('Edytuj ocenę',body,u,'/grades')
+
+def edit_attendance(u,c,aid):
+    a=one(c,'SELECT a.*,st.id student_id FROM attendance a JOIN students st ON st.id=a.student_id JOIN users us ON us.id=st.user_id WHERE a.id=? AND us.school_id=?',(aid,u['school_id']))
+    if not a or not can_manage_student(c,u,a['student_id']): return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień do zmiany tej frekwencji.</p></div>',u)
+    subjects=q(c,'SELECT * FROM subjects WHERE school_id=? ORDER BY name',(u['school_id'],)); body=f"<div class=hero><div><h1>Edytuj frekwencję</h1><div class=muted>Zmiana wpisu frekwencji ucznia.</div></div></div><div class=card><form class=form method=post action='/attendance/{aid}/edit'><input name=date type=date value='{esc(a['date'])}' required><div class=row><select name=status><option value=present {'selected' if a['status']=='present' else ''}>Obecny</option><option value=absent {'selected' if a['status']=='absent' else ''}>Nieobecny</option><option value=late {'selected' if a['status']=='late' else ''}>Spóźnienie</option><option value=excused {'selected' if a['status']=='excused' else ''}>Usprawiedliwiona nieobecność</option><option value=late_excused {'selected' if a['status']=='late_excused' else ''}>Spóźnienie usprawiedliwione</option><option value=excused_present {'selected' if a['status']=='excused_present' else ''}>Nieobecność usprawiedliwiona</option></select><select name=subject_id><option value=''>Cały dzień</option>"+opts(subjects,'id','name',a['subject_id'])+f"</select></div><input name=comment value='{esc(a['comment'])}' placeholder='Komentarz'><button class=btn>Zapisz zmiany</button></form></div>"
+    return layout('Edytuj frekwencję',body,u,'/attendance')
+
+def occurrence_date(weekday, ref=None):
+    ref=ref or date.today(); return ref + timedelta(days=int(weekday)-ref.isoweekday())
+
+def lesson_status_for_student(c, lesson_id, student_id, day):
+    r=one(c,'SELECT status FROM attendance WHERE lesson_id=? AND student_id=? AND date=? ORDER BY id DESC LIMIT 1',(lesson_id,student_id,day.isoformat()))
+    return r['status'] if r else None
+
+def lesson_topic(c, lesson_id, day):
+    r=one(c,'SELECT topic FROM lesson_topics WHERE lesson_id=? AND date=?',(lesson_id,day.isoformat()))
+    return r['topic'] if r else ''
+
+def lesson_card(x,u,c):
+    cls=esc(x['class_name']); teacher=esc(x['teacher']); day=occurrence_date(x['weekday'])
+    status=None
+    if u['role']=='student': status=lesson_status_for_student(c,x['id'],student_id(c,u),day)
+    color={'present':'lesson-present','absent':'lesson-absent','late':'lesson-late','excused':'lesson-excused','late_excused':'lesson-late-excused','excused_present':'lesson-excused-present'}.get(status,'')
+    topic=lesson_topic(c,x['id'],day)
+    meta=(f"<span>{esc(topic)}</span>" if topic else '<span>Brak tematu</span>')
+    return f"<a class='lesson {color}' href='/lesson/{x['id']}?date={day.isoformat()}'><b>{esc(x['subject'])}</b><br>{cls if u['role']!='student' else teacher}<br>s. {esc(x['room'])}<small>{meta}</small></a>"
+
+def schedule_page(u,c):
+    cls=class_for(c,u) if u['role']=='student' else None
+    if u['role']=='teacher': lessons=q(c,'SELECT l.*,cl.name class_name,s.name subject,u.full_name teacher FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id JOIN users u ON u.id=l.teacher_id WHERE l.teacher_id=? OR cl.teacher_id=? ORDER BY l.weekday,l.start_time',(u['id'],u['id']))
+    else:
+        cid=cls['id'] if cls else None; lessons=q(c,'SELECT l.*,cl.name class_name,s.name subject,u.full_name teacher FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id JOIN users u ON u.id=l.teacher_id WHERE l.class_id=? ORDER BY l.weekday,l.start_time',(cid,)) if cid else []
+    cells=''; days=['Poniedziałek','Wtorek','Środa','Czwartek','Piątek']; times=sorted(set(x['start_time'] for x in lessons)); cells+="<div></div>"+''.join(f"<div class=head>{d}</div>" for d in days)
+    for t in times:
+        cells+=f"<div class=head>{esc(t)}</div>"+''.join(next((lesson_card(x,u,c) for x in lessons if x['weekday']==i and x['start_time']==t),'<div></div>') for i in range(1,6))
+    legend=''
+    if u['role']=='student': legend="<div class='pillrow' style='margin-top:14px'><span class='badge present-b'>Obecność</span><span class='badge absent-b'>Nieobecność</span><span class='badge late-b'>Spóźnienie</span><span class='badge'>Kliknij lekcję, aby zobaczyć temat</span></div>"
+    return layout('Plan tygodniowy',f"<div class=hero><div><h1>Plan tygodniowy</h1><div class=muted>Przedmiot jest klikalny — nauczyciel otwiera kartę lekcji, a uczeń widzi temat i swoją frekwencję.</div></div><a class=btn href='/lessons'>Zarządzaj planem</a></div><div class=schedule>{cells or '<div class=empty style=grid-column:1/-1>Brak lekcji.</div>'}</div>{legend}",u,'/schedule')
+
+def lesson_detail(u,c,lid):
+    l=one(c,'SELECT l.*,cl.name class_name,cl.teacher_id homeroom,s.name subject,u.full_name teacher FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id JOIN users u ON u.id=l.teacher_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+    if not l: return layout('Błąd','<div class=card><h1>Nie znaleziono lekcji.</h1></div>',u)
+    if u['role']=='student' and class_for(c,u)['id']!=l['class_id']: return layout('403','<div class=card><h1>403</h1><p>Ta lekcja nie należy do Twojej klasy.</p></div>',u)
+    if u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']: return layout('403','<div class=card><h1>403</h1><p>Nie masz dostępu do tej lekcji.</p></div>',u)
+    try: day=date.fromisoformat(parse_qs(urlparse('/'+'')) if False else '')
+    except: day=None
+    # Date comes from query string in GET handler and is passed via request below; default to current occurrence.
+    day=getattr(u,'_lesson_day',None) if False else None
+    return lesson_detail_for_date(u,c,l, date.today() if date.today().isoweekday()==l['weekday'] else occurrence_date(l['weekday']))
+
+def lesson_detail_for_date(u,c,l,day):
+    students=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE st.class_id=? ORDER BY u.full_name',(l['class_id'],))
+    topic=lesson_topic(c,l['id'],day)
+    if u['role']=='student':
+        sid=student_id(c,u); a=one(c,'SELECT status,comment FROM attendance WHERE lesson_id=? AND student_id=? AND date=? ORDER BY id DESC LIMIT 1',(l['id'],sid,day.isoformat())); grades=q(c,'SELECT g.value,g.weight,g.category,g.comment FROM grades g WHERE g.student_id=? AND g.subject_id=? AND (g.lesson_id=? OR g.lesson_id IS NULL) ORDER BY g.id DESC LIMIT 8',(sid,l['subject_id'],l['id'])); notes=q(c,'SELECT n.text,n.positive,u.full_name teacher FROM notes n JOIN users u ON u.id=n.teacher_id WHERE n.student_id=? AND (n.lesson_id=? OR n.lesson_id IS NULL) ORDER BY n.id DESC LIMIT 8',(sid,l['id']));
+        st=a['status'] if a else None; label={'present':'Obecny','absent':'Nieobecny','late':'Spóźnienie','excused':'Usprawiedliwiona nieobecność','late_excused':'Spóźnienie usprawiedliwione','excused_present':'Nieobecność usprawiedliwiona'}.get(st,'Brak wpisu')
+        box=f"<div class='card'><h3>Frekwencja</h3><span class='status-chip {st or ""}'>{label}</span>{('<p>'+esc(a['comment'])+'</p>') if a and a['comment'] else ''}</div>"
+        gh=''.join(f"<tr><td>{esc(g['value'])}</td><td>{esc(g['weight'])}</td><td>{esc(g['category'])}</td><td>{esc(g['comment'])}</td></tr>" for g in grades) or '<tr><td colspan=4>Brak ocen z tej lekcji/przedmiotu.</td></tr>'
+        nh=''.join(f"<div class=notice><b>{'Pochwała' if n['positive'] else 'Uwaga'}</b> · {esc(n['teacher'])}<br>{esc(n['text'])}</div>" for n in notes) or '<div class=empty>Brak wpisów.</div>'
+        body=f"<div class=hero><div><h1>{esc(l['subject'])}</h1><div class=muted>{esc(l['class_name'])} · {day.strftime('%d.%m.%Y')} · {esc(l['start_time'])}–{esc(l['end_time'])}</div></div></div><div class=grid><div class='card col6'><h3>Temat lekcji</h3><p>{esc(topic) if topic else 'Temat nie został jeszcze dodany.'}</p></div><div class='card col6'><h3>Moja frekwencja</h3>{box}</div><div class='card col12'><h3>Moje oceny z {esc(l['subject'])}</h3><table class=table><tr><th>Ocena</th><th>Waga</th><th>Kategoria</th><th>Komentarz</th></tr>{gh}</table></div><div class='card col12'><h3>Pochwały i uwagi</h3>{nh}</div></div>"
+        return layout('Lekcja',body,u,'/schedule')
+    rows=''
+    for st in students:
+        cur=one(c,'SELECT status,comment FROM attendance WHERE lesson_id=? AND student_id=? AND date=? ORDER BY id DESC LIMIT 1',(l['id'],st['id'],day.isoformat()))
+        cs=cur['status'] if cur else ''
+        cc=cur['comment'] if cur else ''
+        rows += f"<tr><td><b>{esc(st['full_name'])}</b></td><td><select name='status_{st['id']}'><option value='' {'selected' if not cs else ''}>-- brak wpisu --</option><option value='present' {'selected' if cs=='present' else ''}>Obecny</option><option value='absent' {'selected' if cs=='absent' else ''}>Nieobecny</option><option value='late' {'selected' if cs=='late' else ''}>Spóźnienie</option><option value='excused' {'selected' if cs=='excused' else ''}>Usprawiedliwiona nieobecność</option><option value='late_excused' {'selected' if cs=='late_excused' else ''}>Spóźnienie usprawiedliwione</option><option value='excused_present' {'selected' if cs=='excused_present' else ''}>Nieobecność usprawiedliwiona</option></select></td><td><input name='comment_{st['id']}' value='{esc(cc)}' placeholder='Komentarz'></td></tr>"
+    grade_rows=''.join(f"<option value='{st['id']}'>{esc(st['full_name'])}</option>" for st in students)
+    note_rows=grade_rows
+    body=f"<div class=hero><div><h1>{esc(l['subject'])}</h1><div class=muted>{esc(l['class_name'])} · {day.strftime('%d.%m.%Y')} · {esc(l['start_time'])}–{esc(l['end_time'])}</div></div></div><div class=grid><div class='card col12'><h3>Temat lekcji</h3><form class=form method=post action='/lesson/{l['id']}/topic'><input type=date name=date value='{day.isoformat()}'><input name=topic value='{esc(topic)}' placeholder='Wpisz temat lekcji' required><button class=btn>Zapisz temat</button></form></div><div class='card col12'><h3>Frekwencja na tej lekcji</h3><form class=form method=post action='/lesson/{l['id']}/attendance'><input type=hidden name=date value='{day.isoformat()}'><table class=table><tr><th>Uczeń</th><th>Status</th><th>Komentarz</th></tr>{rows}</table><button class=btn>Zapisz frekwencję</button></form><p class=muted>Spóźnienie jest liczone jako 100% frekwencji.</p></div><div class='card col6'><h3>Dodaj ocenę</h3><form class=form method=post action='/lesson/{l['id']}/grade'><input type=hidden name=subject_id value='{l['subject_id']}'><input type=hidden name=class_id value='{l['class_id']}'><input type=hidden name=date value='{day.isoformat()}'><select name=student_id required>{grade_rows}</select><input name=value placeholder='Ocena, np. 5+' required><div class=row><input name=weight type=number step=.5 min=.5 value='1'><input name=category value='Ocena'></div><input name=comment placeholder='Komentarz'><button class=btn>Dodaj ocenę</button></form></div><div class='card col6'><h3>Dodaj pochwałę / uwagę</h3><form class=form method=post action='/lesson/{l['id']}/note'><input type=hidden name=date value='{day.isoformat()}'><select name=student_id required>{note_rows}</select><select name=positive><option value='1'>Pochwała</option><option value='0'>Uwaga</option></select><textarea name=text placeholder='Treść wpisu' required></textarea><button class=btn>Dodaj wpis</button></form></div></div>"
+    return layout('Lekcja',body,u,'/schedule')
+
+def lessons_page(u,c):
+    if u['role'] not in ('admin','teacher'): return schedule_page(u,c)
+    classes=q(c,'SELECT * FROM classes WHERE school_id=? ORDER BY name',(u['school_id'],)); subjects=q(c,'SELECT * FROM subjects WHERE school_id=? ORDER BY name',(u['school_id'],)); teachers=q(c,"SELECT id,full_name FROM users WHERE role='teacher' AND school_id=? ORDER BY full_name",(u['school_id'],))
+    where='l.teacher_id=?' if u['role']=='teacher' else 'cl.school_id=?'; args=(u['id'],) if u['role']=='teacher' else (u['school_id'],)
+    rows=q(c,f'SELECT l.*,cl.name class_name,s.name subject,u.full_name teacher FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id JOIN users u ON u.id=l.teacher_id WHERE {where} ORDER BY l.weekday,l.start_time',args)
+    teacher_select=opts(teachers,'id','full_name',u['id'] if u['role']=='teacher' else None)
+    disabled=' disabled' if u['role']=='teacher' else ''
+    form="<div class='card col12'><h3>Dodaj lekcję</h3><form class=form method=post action=/lesson><div class=row><select name=class_id required>"+opts(classes,'id','name')+"</select><select name=subject_id required>"+opts(subjects,'id','name')+"</select></div><div class=row><select name=teacher_id"+disabled+">"+teacher_select+"</select><select name=weekday><option value=1>Poniedziałek</option><option value=2>Wtorek</option><option value=3>Środa</option><option value=4>Czwartek</option><option value=5>Piątek</option></select></div><div class=row><input name=start_time type=time value='08:00'><input name=end_time type=time value='08:45'></div><input name=room placeholder='Sala'><button class=btn>Dodaj lekcję</button></form></div>"
+    dn={1:'Pon.',2:'Wt.',3:'Śr.',4:'Czw.',5:'Pt.'}; table='<table class=table><tr><th>Dzień</th><th>Godzina</th><th>Klasa</th><th>Przedmiot</th><th>Nauczyciel</th><th>Sala</th><th>Akcje</th></tr>'
+    for x in rows: table+="<tr><td>%s</td><td>%s–%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><a class='btn sm gray' href='/lesson/%s/edit'>Edytuj</a> <form method=post action='/lesson/%s/delete' style='display:inline'><button class='btn sm red' onclick=\"return confirm('Usunąć lekcję?')\">Usuń</button></form></td></tr>"%(dn.get(x['weekday']),esc(x['start_time']),esc(x['end_time']),esc(x['class_name']),esc(x['subject']),esc(x['teacher']),esc(x['room']),x['id'],x['id'])
+    table+='</table>'
+    return layout('Edytor planu',"<div class=hero><div><h1>Plan lekcji</h1><div class=muted>Dodawaj, edytuj i usuwaj pozycje planu.</div></div></div><div class=grid>"+form+"<div class=card col12><h3>Aktualny plan</h3>"+table+"</div></div>",u,'/lessons')
+def edit_lesson(u,c,lid):
+    l=one(c,'SELECT l.*,cl.name class_name,s.name subject FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id WHERE l.id=?',(lid,)); classes=q(c,'SELECT * FROM classes WHERE school_id=?',(u['school_id'],)); subjects=q(c,'SELECT * FROM subjects WHERE school_id=?',(u['school_id'],)); teachers=q(c,"SELECT id,full_name FROM users WHERE role='teacher' AND school_id=?",(u['school_id'],))
+    if not l: return layout('Błąd','<div class=card>Nie znaleziono lekcji.</div>',u)
+    days=['','Poniedziałek','Wtorek','Środa','Czwartek','Piątek']
+    body="<div class=hero><div><h1>Edytuj lekcję</h1><div class=muted>%s · %s</div></div></div><div class=card><form class=form method=post action='/lesson/%s/edit'><div class=row><select name=class_id>%s</select><select name=subject_id>%s</select></div><div class=row><select name=teacher_id>%s</select><select name=weekday>%s</select></div><div class=row><input name=start_time type=time value='%s'><input name=end_time type=time value='%s'></div><input name=room value='%s' placeholder='Sala'><button class=btn>Zapisz zmiany</button></form></div>"%(esc(l['subject']),esc(l['class_name']),lid,opts(classes,'id','name',l['class_id']),opts(subjects,'id','name',l['subject_id']),opts(teachers,'id','full_name',l['teacher_id']),''.join("<option value='%s'%s>%s</option>"%(i,' selected' if i==l['weekday'] else '',days[i]) for i in range(1,6)),esc(l['start_time']),esc(l['end_time']),esc(l['room']))
+    return layout('Edycja lekcji',body,u,'/lessons')
+def calendar_page(u,c):
+    y,m=date.today().year,date.today().month; meetings=q(c,'SELECT * FROM meetings WHERE school_id=? ORDER BY date',(u['school_id'],)); anns=q(c,'SELECT * FROM announcements WHERE school_id=? ORDER BY created_at',(u['school_id'],)); events={}
+    for x in meetings: events.setdefault(x['date'][:10],[]).append(('Spotkanie',x['title']))
+    for x in anns: events.setdefault(x['created_at'][:10],[]).append(('Komunikat',x['title']))
+    cal=calendar.monthcalendar(y,m); names=['Pn','Wt','Śr','Cz','Pt','Sb','Nd']; out=''.join("<div class=cal-head>%s</div>"%n for n in names)
+    for week in cal:
+        for d in week:
+            if not d: out+='<div class="day mutedday"></div>'; continue
+            ds=f'{y:04d}-{m:02d}-{d:02d}'; cls='day today' if ds==date.today().isoformat() else 'day'; ev=''.join("<span class=event>%s: %s</span>"%(esc(a),esc(b)) for a,b in events.get(ds,[])); out+="<div class='%s'><div class=daynum>%s</div>%s</div>"%(cls,d,ev)
+    upcoming=q(c,'SELECT * FROM meetings WHERE school_id=? AND date>=? ORDER BY date LIMIT 8',(u['school_id'],datetime.now().strftime('%Y-%m-%d')))
+    months=['','Styczeń','Luty','Marzec','Kwiecień','Maj','Czerwiec','Lipiec','Sierpień','Wrzesień','Październik','Listopad','Grudzień']
+    return layout('Kalendarz',"<div class=hero><div><h1>Kalendarz</h1><div class=muted>%s %s</div></div></div><div class=grid><div class=card col8><div class=calendar>%s</div></div><div class=card col4><h3>Nadchodzące wydarzenia</h3>%s</div></div>"%(months[m],y,out,''.join("<div class=notice><b>%s</b><br>%s<br>%s</div>"%(esc(x['title']),esc(x['date']),esc(x['location'])) for x in upcoming) or '<div class=empty>Brak wydarzeń.</div>'),u,'/calendar')
+def admins_page(u,c):
+    if u['role'] != 'admin':
+        return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u,'/admins')
+    admins=q(c,"SELECT id,username,full_name,email,active FROM users WHERE role='admin' AND school_id=? ORDER BY full_name",(u['school_id'],))
+    rows=''.join(f"<tr><td><b>{esc(a['full_name'])}</b></td><td>{esc(a['username'])}</td><td>{esc(a['email'] or '—')}</td><td><span class='badge'>{'Aktywny' if a['active'] else 'Nieaktywny'}</span></td><td>{('<span class=muted>To Ty</span>' if a['id']==u['id'] else f"<form method=post action='/admin/{a['id']}/delete' onsubmit=\"return confirm('Usunąć administratora?')\"><button class='btn sm red'>Usuń</button></form>")}</td></tr>" for a in admins)
+    body=f"<div class='hero'><div><h1>Administratorzy</h1><div class='muted'>Dodawaj i usuwaj konta administratorów szkoły.</div></div></div><div class='grid'><div class='card col7'><h3>Lista administratorów</h3><table class='table'><thead><tr><th>Osoba</th><th>Login</th><th>E-mail</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div><div class='card col5'><h3>Dodaj administratora</h3><form class='form' method='post' action='/admin'><input name='full_name' placeholder='Imię i nazwisko' required><input name='username' placeholder='Login' required><input name='password' placeholder='Hasło' value='admin123' required><input name='email' placeholder='E-mail'><button class='btn'>Dodaj administratora</button></form></div></div>"
+    return layout('Administratorzy',body,u,'/admins')
+
+def announcements_page(u,c):
+    rows=q(c,'SELECT * FROM announcements WHERE school_id=? ORDER BY id DESC',(u['school_id'],)); form=f"<div class='card col12'><h3>Dodaj komunikat</h3><form class=form method=post action=/announcement><input name=title placeholder='Tytuł' required><textarea name=body placeholder='Treść' required></textarea><select name=target><option>Wszyscy</option><option>Uczniowie</option><option>Nauczyciele</option></select><button class=btn>Opublikuj</button></form></div>" if u['role'] in ('admin','teacher') else ''
+    cards=''.join(f"<div class=card><span class=badge>{esc(x['target'])}</span><h3>{esc(x['title'])}</h3><p>{esc(x['body'])}</p><small class=muted>{esc(x['created_at'])}</small></div>" for x in rows)
+    return layout('Komunikaty',f"<div class=hero><div><h1>Komunikaty</h1><div class=muted>Ważne informacje dla społeczności szkoły.</div></div></div><div class=grid>{form}{cards}</div>",u,'/announcements')
+
+def messages_page(u,c):
+    inbox=q(c,'SELECT m.*,s.full_name sender FROM messages m JOIN users s ON s.id=m.sender_id WHERE m.recipient_id=? ORDER BY m.id DESC',(u['id'],)); users=q(c,'SELECT id,full_name FROM users WHERE school_id=? AND id<>? AND active=1 ORDER BY full_name',(u['school_id'],u['id']))
+    form="<div class='card col4'><h3>Nowa wiadomość</h3><form class=form method=post action=/message><select name=recipient_id>"+opts(users,'id','full_name')+"</select><input name=subject placeholder='Temat' required><textarea name=body placeholder='Treść' required></textarea><button class=btn>Wyślij</button></form></div>"
+    inboxhtml=''.join("<article style='padding:12px 0;border-bottom:1px solid var(--line)'><b>%s</b><br><small>od %s · %s</small><p>%s</p></article>"%(esc(x['subject']),esc(x['sender']),esc(x['created_at']),esc(x['body'])) for x in inbox) or '<div class=empty>Brak wiadomości.</div>'
+    return layout('Wiadomości',"<div class=hero><div><h1>Wiadomości</h1><div class=muted>Bezpośrednia komunikacja.</div></div></div><div class=grid>"+form+"<div class='card col8'><h3>Odebrane</h3>"+inboxhtml+"</div></div>",u,'/messages')
+def my_notes_page(u,c):
+    sid=student_id(c,u)
+    rows=q(c,'SELECT n.*,u.full_name teacher,s.name subject FROM notes n JOIN users u ON u.id=n.teacher_id LEFT JOIN lessons l ON l.id=n.lesson_id LEFT JOIN subjects s ON s.id=l.subject_id WHERE n.student_id=? ORDER BY n.id DESC',(sid,))
+    cards=''.join(f"<div class='note-row {'note-positive' if n['positive'] else 'note-negative'}'><div class='note-title'>{'Pochwała' if n['positive'] else 'Uwaga'} · {esc(n['teacher'])}</div><div class='note-text'>{esc(n['text'])}</div><p class=muted>{(' · '+esc(n['subject'])) if n['subject'] else ''} · {esc(n['date'] or n['created_at'])}</p></div>" for n in rows) or '<div class=empty>Brak uwag i pochwał.</div>'
+    return layout('Uwagi i pochwały',f"<div class=hero><div><h1>Uwagi i pochwały</h1><div class=muted>Wpisy dotyczące Twojej pracy i zachowania.</div></div></div><div class=grid>{cards}</div>",u,'/my-notes')
+
+def edit_note(u,c,nid):
+    n=one(c,'SELECT n.*,u.full_name teacher FROM notes n JOIN users u ON u.id=n.teacher_id WHERE n.id=?',(nid,))
+    if not n or (u['role']!='admin' and n['teacher_id']!=u['id']): return layout('403','<div class=card><h1>403</h1><p>Możesz edytować tylko wpis dodany przez siebie. Administrator może edytować każdy wpis.</p></div>',u)
+    body=f"<div class='hero'><div><h1>Edytuj uwagę / pochwałę</h1><div class=muted>Autor: {esc(n['teacher'])}</div></div></div><div class='card'><form class=form method=post action='/note/{nid}/edit'><select name=positive><option value='1' {'selected' if n['positive'] else ''}>Pochwała</option><option value='0' {'selected' if not n['positive'] else ''}>Uwaga</option></select><textarea name=text required>{esc(n['text'])}</textarea><button class=btn>Zapisz zmiany</button></form></div>"
+    return layout('Edycja wpisu',body,u,'/classes')
+
+def subjects_page(u,c):
+    if u['role']!='admin': return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u,'/subjects')
+    rows=q(c,'SELECT s.*, (SELECT COUNT(*) FROM enrollments e WHERE e.subject_id=s.id) n FROM subjects s WHERE s.school_id=? ORDER BY s.name',(u['school_id'],))
+    table='<table class=table><tr><th>Przedmiot</th><th>Skrót</th><th>Uczniowie</th><th></th></tr>'+''.join(f"<tr><td><b>{esc(x['name'])}</b></td><td>{esc(x['short_name'])}</td><td>{x['n']}</td><td><form method=post action='/subject/{x['id']}/delete' onsubmit=\"return confirm('Usunąć przedmiot?')\"><button class='btn sm red'>Usuń</button></form></td></tr>" for x in rows)+'</table>'
+    body=f"<div class=hero><div><h1>Przedmioty</h1><div class=muted>Administrator może dodawać własne nazwy lekcji/przedmiotów.</div></div></div><div class=grid><div class='card col5'><h3>Dodaj przedmiot</h3><form class=form method=post action=/subject><input name=name placeholder='Nazwa przedmiotu, np. Fizyka' required><input name=short_name placeholder='Skrót, np. FIZ'><button class=btn>Dodaj przedmiot</button></form></div><div class='card col7'><h3>Lista przedmiotów</h3>{table if rows else '<div class=empty>Brak przedmiotów.</div>'}</div></div>"
+    return layout('Przedmioty',body,u,'/subjects')
+
+def profile(u,c):
+    return layout('Profil',f"<div class=hero><div><h1>Profil</h1><div class=muted>Dane konta i bezpieczeństwo.</div></div></div><div class='grid'><div class='card col6'><h3>Dane konta</h3><p><b>Imię i nazwisko:</b> {esc(u['full_name'])}</p><p><b>Login:</b> {esc(u['username'])}</p><p><b>Rola:</b> {esc(u['role'])}</p><p><b>E-mail:</b> {esc(u['email'])}</p></div><div class='card col6'><h3>Zmiana hasła</h3><form class=form method=post action=/profile/password><input type=password name=current_password placeholder='Obecne hasło' required><input type=password name=new_password placeholder='Nowe hasło' minlength=4 required><input type=password name=confirm_password placeholder='Powtórz nowe hasło' minlength=4 required><button class=btn>Zmień hasło</button></form></div></div>",u,'')
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,*a): pass
+    def send(self,status=200,body='',ctype='text/html; charset=utf-8'):
+        b=body.encode(); self.send_response(status); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
+    def redirect(self,path): self.send_response(303); self.send_header('Location',path); self.end_headers()
+    def user(self):
+        ck=cookies.SimpleCookie(self.headers.get('Cookie','')); sid=ck.get('sid'); return SESSIONS.get(sid.value) if sid else None
+    def form(self):
+        n=int(self.headers.get('Content-Length','0')); raw=self.rfile.read(n).decode(); return {k:v[0] for k,v in parse_qs(raw).items()}
+    def do_GET(self):
+        path=urlparse(self.path).path; u=self.user()
+        if path in ('/','/login'): return self.send(body=login_page())
+        if path=='/logout':
+            ck=cookies.SimpleCookie(self.headers.get('Cookie','')); sid=ck.get('sid');
+            if sid: SESSIONS.pop(sid.value,None)
+            return self.redirect('/login')
+        if not u: return self.redirect('/login')
+        c=connect()
+        try:
+            if path=='/dashboard': out=dash(u,c)
+            elif path=='/profile': out=profile(u,c)
+            elif path=='/classes':
+                if u['role']=='student': out=layout('403','<div class=card><h1>403</h1><p>Uczeń nie ma dostępu do listy innych klas.</p></div>',u)
+                else: out=classes_page(u,c)
+            elif path=='/schedule': out=schedule_page(u,c)
+            elif path=='/calendar': out=calendar_page(u,c)
+            elif path=='/attendance': out=attendance_page(u,c)
+            elif path=='/grades': out=grades_page(u,c)
+            elif path=='/announcements': out=announcements_page(u,c)
+            elif path=='/admins': out=admins_page(u,c)
+            elif path=='/subjects': out=subjects_page(u,c)
+            elif path=='/my-notes': out=my_notes_page(u,c)
+            elif path=='/messages': out=messages_page(u,c)
+            elif path=='/lessons': out=lessons_page(u,c)
+            elif path.startswith('/grade/') and path.endswith('/edit'): out=edit_grade(u,c,int(path.split('/')[2]))
+            elif path.startswith('/attendance/') and path.endswith('/edit'): out=edit_attendance(u,c,int(path.split('/')[2]))
+            elif path.startswith('/note/') and path.endswith('/edit'): out=edit_note(u,c,int(path.split('/')[2]))
+            elif path.startswith('/student/'): out=student_page(u,c,int(path.split('/')[2]))
+            elif path.startswith('/lesson/') and path.endswith('/edit'): out=edit_lesson(u,c,int(path.split('/')[2]))
+            elif path.startswith('/lesson/') and path.count('/')==2: 
+                lid=int(path.split('/')[2]); l=one(c,'SELECT l.*,cl.name class_name,cl.teacher_id homeroom,s.name subject,u.full_name teacher FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id JOIN users u ON u.id=l.teacher_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                if not l: out=layout('Błąd','<div class=card><h1>Nie znaleziono lekcji.</h1></div>',u)
+                else:
+                    qdate=parse_qs(urlparse(self.path).query).get('date',[None])[0]
+                    try: day=date.fromisoformat(qdate) if qdate else occurrence_date(l['weekday'])
+                    except: day=occurrence_date(l['weekday'])
+                    out=lesson_detail_for_date(u,c,l,day)
+            else: out=layout('404','<div class=card><h1>404</h1><p>Nie znaleziono strony.</p></div>',u)
+            self.send(body=out)
+        finally: c.close()
+    def do_POST(self):
+        path=urlparse(self.path).path; data=self.form(); u=self.user()
+        if path=='/login':
+            c=connect(); username=data.get('username','').strip(); password=data.get('password',''); selected_role=data.get('role','auto'); row=one(c,'SELECT * FROM users WHERE username=? AND password_hash=? AND active=1',(username,hpw(password)));
+            if row and selected_role not in ('','auto') and row['role'] != selected_role: row=None; c.close()
+            if not row: return self.send(body=login_page('Nieprawidłowe dane logowania.'))
+            sid=secrets.token_urlsafe(24); SESSIONS[sid]=dict(row); self.send_response(303); self.send_header('Location','/dashboard'); self.send_header('Set-Cookie',f'sid={sid}; HttpOnly; SameSite=Lax'); self.end_headers(); return
+        if not u: return self.redirect('/login')
+        c=connect()
+        try:
+            note_redirect_student=None
+            if path.startswith('/note/'):
+                nr=one(c,'SELECT student_id FROM notes WHERE id=?',(int(path.split('/')[2]),))
+                note_redirect_student=nr['student_id'] if nr else None
+            if path=='/profile/password':
+                if data.get('new_password')!=data.get('confirm_password'): raise ValueError('Nowe hasła nie są takie same.')
+                if len(data.get('new_password',''))<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
+                row=one(c,'SELECT password_hash FROM users WHERE id=?',(u['id'],))
+                if not row or row['password_hash']!=hpw(data.get('current_password','')): raise ValueError('Obecne hasło jest nieprawidłowe.')
+                c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(data['new_password']),u['id']))
+            elif path.startswith('/student/') and path.endswith('/password') and u['role']=='admin':
+                sid=int(path.split('/')[2]); st=one(c,'SELECT user_id FROM students st JOIN users us ON us.id=st.user_id WHERE st.id=? AND us.school_id=?',(sid,u['school_id']))
+                if not st: raise ValueError('Nie znaleziono ucznia.')
+                if data.get('new_password')!=data.get('confirm_password'): raise ValueError('Nowe hasła nie są takie same.')
+                if len(data.get('new_password',''))<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
+                c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(data['new_password']),st['user_id']))
+            elif path=='/subject' and u['role']=='admin':
+                name=data.get('name','').strip(); short=data.get('short_name','').strip()
+                if not name: raise ValueError('Nazwa przedmiotu jest wymagana.')
+                c.execute('INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(u['school_id'],name,short))
+                new_sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                for st in q(c,'SELECT id FROM students WHERE class_id IN (SELECT id FROM classes WHERE school_id=?)',(u['school_id'],)):
+                    c.execute('INSERT OR IGNORE INTO enrollments(student_id,subject_id) VALUES(?,?)',(st['id'],new_sid))
+            elif path.startswith('/subject/') and path.endswith('/delete') and u['role']=='admin':
+                subid=int(path.split('/')[2]); sub=one(c,'SELECT id FROM subjects WHERE id=? AND school_id=?',(subid,u['school_id']))
+                if not sub: raise ValueError('Nie znaleziono przedmiotu.')
+                if one(c,'SELECT id FROM grades WHERE subject_id=? LIMIT 1',(subid,)) or one(c,'SELECT id FROM lessons WHERE subject_id=? LIMIT 1',(subid,)) or one(c,'SELECT id FROM attendance WHERE subject_id=? LIMIT 1',(subid,)): raise ValueError('Nie można usunąć przedmiotu, który ma już oceny, lekcje lub frekwencję.')
+                c.execute('DELETE FROM enrollments WHERE subject_id=?',(subid,)); c.execute('DELETE FROM subjects WHERE id=?',(subid,))
+            elif path=='/grade' and u['role'] in ('admin','teacher'):
+                sid=int(data['student_id'])
+                if not can_manage_student(c,u,sid): raise ValueError('Tylko administrator lub wychowawca tej klasy może zmieniać oceny.')
+                c.execute('INSERT INTO grades(student_id,subject_id,teacher_id,value,weight,category,comment) VALUES(?,?,?,?,?,?,?)',(sid,data['subject_id'],u['id'],data['value'],float(data.get('weight','1') or 1),data.get('category','Ocena'),data.get('comment','')))
+            elif path=='/attendance' and u['role'] in ('admin','teacher'):
+                sid=int(data['student_id'])
+                if not can_manage_student(c,u,sid): raise ValueError('Tylko administrator lub wychowawca tej klasy może zmieniać frekwencję.')
+                c.execute('INSERT INTO attendance(student_id,date,status,subject_id,comment) VALUES(?,?,?,?,?)',(sid,data['date'],data['status'],data.get('subject_id') or None,data.get('comment','')))
+            elif path.startswith('/note/') and path.endswith('/edit') and u['role'] in ('admin','teacher'):
+                nid=int(path.split('/')[2]); n=one(c,'SELECT teacher_id FROM notes WHERE id=?',(nid,))
+                if not n or (u['role']!='admin' and n['teacher_id']!=u['id']): raise ValueError('Możesz edytować tylko wpis dodany przez siebie. Administrator może edytować każdy wpis.')
+                text=data.get('text','').strip()
+                if not text: raise ValueError('Treść wpisu jest wymagana.')
+                c.execute('UPDATE notes SET text=?,positive=? WHERE id=?',(text,int(data.get('positive','0')),nid))
+            elif path.startswith('/note/') and path.endswith('/delete') and u['role'] in ('admin','teacher'):
+                nid=int(path.split('/')[2]); n=one(c,'SELECT teacher_id,student_id FROM notes WHERE id=?',(nid,))
+                if not n or (u['role']!='admin' and n['teacher_id']!=u['id']): raise ValueError('Możesz usunąć tylko wpis dodany przez siebie. Administrator może usunąć każdy wpis.')
+                c.execute('DELETE FROM notes WHERE id=?',(nid,))
+            elif path=='/note' and u['role'] in ('admin','teacher'):
+                sid=int(data['student_id'])
+                if not can_manage_student(c,u,sid): raise ValueError('Tylko administrator lub wychowawca tej klasy może dodawać pochwały i uwagi.')
+                c.execute('INSERT INTO notes(student_id,teacher_id,text,positive) VALUES(?,?,?,?)',(sid,u['id'],data['text'],int(data.get('positive','0'))))
+            elif path.startswith('/grade/') and path.endswith('/edit') and u['role'] in ('admin','teacher'):
+                gid=int(path.split('/')[2]); g=one(c,'SELECT student_id FROM grades WHERE id=?',(gid,))
+                if not g or not can_manage_student(c,u,g['student_id']): raise ValueError('Brak uprawnień do tej oceny.')
+                c.execute('UPDATE grades SET subject_id=?,value=?,weight=?,category=?,comment=? WHERE id=?',(data['subject_id'],data['value'],float(data.get('weight','1') or 1),data.get('category','Ocena'),data.get('comment',''),gid))
+            elif path.startswith('/grade/') and path.endswith('/delete') and u['role'] in ('admin','teacher'):
+                gid=int(path.split('/')[2]); g=one(c,'SELECT student_id FROM grades WHERE id=?',(gid,))
+                if not g or not can_manage_student(c,u,g['student_id']): raise ValueError('Brak uprawnień do tej oceny.')
+                c.execute('DELETE FROM grades WHERE id=?',(gid,))
+            elif path.startswith('/attendance/') and path.endswith('/edit') and u['role'] in ('admin','teacher'):
+                aid=int(path.split('/')[2]); a=one(c,'SELECT student_id FROM attendance WHERE id=?',(aid,))
+                if not a or not can_manage_student(c,u,a['student_id']): raise ValueError('Brak uprawnień do tej frekwencji.')
+                c.execute('UPDATE attendance SET date=?,status=?,subject_id=?,comment=? WHERE id=?',(data['date'],data['status'],data.get('subject_id') or None,data.get('comment',''),aid))
+            elif path.startswith('/attendance/') and path.endswith('/delete') and u['role'] in ('admin','teacher'):
+                aid=int(path.split('/')[2]); a=one(c,'SELECT student_id FROM attendance WHERE id=?',(aid,))
+                if not a or not can_manage_student(c,u,a['student_id']): raise ValueError('Brak uprawnień do tej frekwencji.')
+                c.execute('DELETE FROM attendance WHERE id=?',(aid,))
+            elif path=='/message': c.execute('INSERT INTO messages(school_id,sender_id,recipient_id,subject,body) VALUES(?,?,?,?,?)',(u['school_id'],u['id'],data['recipient_id'],data['subject'],data['body']))
+            elif path=='/announcement' and u['role'] in ('admin','teacher'): c.execute('INSERT INTO announcements(school_id,title,body,target) VALUES(?,?,?,?)',(u['school_id'],data['title'],data['body'],data.get('target','Wszyscy')))
+            elif path=='/user' and u['role']=='admin':
+                role=data.get('role','student')
+                if role not in ('student','teacher'): raise ValueError('To miejsce służy do tworzenia uczniów i nauczycieli.')
+                username=data['username']; password=data.get('password','demo123'); c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(username,hpw(password),role,u['school_id'],data['full_name'],data.get('email',''))); uid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                if role=='student': c.execute('INSERT INTO students(user_id,class_id) VALUES(?,?)',(uid,data.get('class_id') or None)); stid=c.execute('SELECT last_insert_rowid()').fetchone()[0]; [c.execute('INSERT OR IGNORE INTO enrollments(student_id,subject_id) VALUES(?,?)',(stid,s['id'])) for s in q(c,'SELECT id FROM subjects WHERE school_id=?',(u['school_id'],))]
+            elif path=='/admin' and u['role']=='admin':
+                username=data['username'].strip(); password=data.get('password','admin123'); c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(username,hpw(password),'admin',u['school_id'],data['full_name'],data.get('email','')))
+            elif path.startswith('/admin/') and path.endswith('/delete') and u['role']=='admin':
+                aid=int(path.split('/')[2])
+                if aid==u['id']: raise ValueError('Nie można usunąć własnego konta administratora.')
+                c.execute("DELETE FROM users WHERE id=? AND role='admin' AND school_id=?",(aid,u['school_id']))
+            elif path=='/class' and u['role']=='admin': c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(u['school_id'],data['name'],int(data.get('year','1')),data.get('teacher_id') or None))
+            elif path.startswith('/class/') and path.endswith('/delete') and u['role']=='admin':
+                cid=int(path.split('/')[2]); cls=one(c,'SELECT id FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
+                if not cls: raise ValueError('Nie znaleziono klasy.')
+                student_rows=q(c,'SELECT user_id FROM students WHERE class_id=?',(cid,))
+                c.execute('DELETE FROM students WHERE class_id=?',(cid,))
+                for st in student_rows: c.execute('DELETE FROM users WHERE id=?',(st['user_id'],))
+                c.execute('DELETE FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
+            elif path.startswith('/lesson/') and path.endswith('/topic') and u['role'] in ('admin','teacher'):
+                lid=int(path.split('/')[2]); l=one(c,'SELECT l.class_id,l.teacher_id,l.subject_id,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                if not l or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień do tej lekcji.')
+                c.execute('INSERT INTO lesson_topics(lesson_id,date,topic) VALUES(?,?,?) ON CONFLICT(lesson_id,date) DO UPDATE SET topic=excluded.topic',(lid,data['date'],data['topic']))
+            elif path.startswith('/lesson/') and path.endswith('/attendance') and u['role'] in ('admin','teacher'):
+                lid=int(path.split('/')[2]); l=one(c,'SELECT l.class_id,l.teacher_id,l.subject_id,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                if not l or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień do tej lekcji.')
+                day=data['date']; students=q(c,'SELECT id FROM students WHERE class_id=?',(l['class_id'],))
+                for st in students:
+                    status=data.get('status_'+str(st['id']),'').strip()
+                    if not status: continue
+                    comment=data.get('comment_'+str(st['id']),'')
+                    old=one(c,'SELECT id FROM attendance WHERE lesson_id=? AND student_id=? AND date=?',(lid,st['id'],day))
+                    if old and not status: c.execute('DELETE FROM attendance WHERE id=?',(old['id'],))
+                    elif old: c.execute('UPDATE attendance SET status=?,comment=? WHERE id=?',(status,comment,old['id']))
+                    elif status: c.execute('INSERT INTO attendance(student_id,date,status,subject_id,lesson_id,comment) VALUES(?,?,?,?,?,?)',(st['id'],day,status,l['subject_id'],lid,comment))
+            elif path.startswith('/lesson/') and path.endswith('/grade') and u['role'] in ('admin','teacher'):
+                lid=int(path.split('/')[2]); l=one(c,'SELECT l.subject_id,l.class_id,l.teacher_id,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                if not l or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień do tej lekcji.')
+                sid=int(data['student_id']); st=one(c,'SELECT id FROM students WHERE id=? AND class_id=?',(sid,l['class_id']))
+                if not st: raise ValueError('Uczeń nie należy do tej klasy.')
+                c.execute('INSERT INTO grades(student_id,subject_id,teacher_id,value,weight,category,comment,lesson_id,date) VALUES(?,?,?,?,?,?,?,?,?)',(sid,l['subject_id'],u['id'],data['value'],float(data.get('weight','1') or 1),data.get('category','Ocena'),data.get('comment',''),lid,data.get('date') or date.today().isoformat()))
+            elif path.startswith('/lesson/') and path.endswith('/note') and u['role'] in ('admin','teacher'):
+                lid=int(path.split('/')[2]); l=one(c,'SELECT l.class_id,l.teacher_id,l.subject_id,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                if not l or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień do tej lekcji.')
+                sid=int(data['student_id']); st=one(c,'SELECT id FROM students WHERE id=? AND class_id=?',(sid,l['class_id']))
+                if not st: raise ValueError('Uczeń nie należy do tej klasy.')
+                c.execute('INSERT INTO notes(student_id,teacher_id,text,positive,lesson_id,date) VALUES(?,?,?,?,?,?)',(sid,u['id'],data['text'],int(data.get('positive','0')),lid,data.get('date') or date.today().isoformat()))
+            elif path=='/lesson' and u['role'] in ('admin','teacher'):
+                tid=u['id'] if u['role']=='teacher' else int(data['teacher_id']); c.execute('INSERT INTO lessons(class_id,subject_id,teacher_id,weekday,start_time,end_time,room) VALUES(?,?,?,?,?,?,?)',(data['class_id'],data['subject_id'],tid,int(data['weekday']),data['start_time'],data['end_time'],data.get('room','')))
+            elif path.startswith('/lesson/') and path.endswith('/edit') and u['role'] in ('admin','teacher'):
+                lid=int(path.split('/')[2]); c.execute('UPDATE lessons SET class_id=?,subject_id=?,teacher_id=?,weekday=?,start_time=?,end_time=?,room=? WHERE id=?',(data['class_id'],data['subject_id'],data['teacher_id'],int(data['weekday']),data['start_time'],data['end_time'],data.get('room',''),lid))
+            elif path.startswith('/lesson/') and path.endswith('/delete') and u['role'] in ('admin','teacher'): c.execute('DELETE FROM lessons WHERE id=?',(int(path.split('/')[2]),))
+            elif path.startswith('/student/') and path.endswith('/delete') and u['role']=='admin':
+                sid=int(path.split('/')[2]); st=one(c,'SELECT user_id FROM students WHERE id=?',(sid,));
+                if st: c.execute('DELETE FROM students WHERE id=?',(sid,)); c.execute('DELETE FROM users WHERE id=?',(st['user_id'],))
+            else: c.close(); return self.send(403,layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u))
+            c.commit()
+        except (sqlite3.IntegrityError,ValueError,KeyError) as e:
+            c.rollback(); c.close(); return self.send(body=layout('Błąd',f"<div class=card><h2>Nie udało się zapisać</h2><p>{esc(e)}</p></div>",u))
+        c.close()
+        if path.startswith('/note/'):
+            target='/student/'+str(note_redirect_student) if note_redirect_student else '/classes'
+        elif path=='/note': target='/student/'+str(data.get('student_id'))
+        elif path=='/profile/password': target='/profile'
+        elif path.startswith('/student/') and path.endswith('/password'): target='/student/'+path.split('/')[2]
+        elif path=='/subject' or path.startswith('/subject/'): target='/subjects'
+        elif path.startswith('/grade'): target='/grades'
+        elif path.startswith('/attendance'): target='/attendance'
+        elif path.startswith('/lesson/'): target='/lesson/'+path.split('/')[2]
+        elif path.startswith('/lesson'): target='/lessons'
+        elif path.startswith('/student/') or path=='/class': target='/classes'
+        elif path=='/user': target='/classes'
+        else: target='/dashboard'
+        self.redirect(target)
+
+if __name__=='__main__':
+    init(); print(f'Super dziennik 4.0: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
