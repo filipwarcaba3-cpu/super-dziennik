@@ -8,7 +8,7 @@ import sqlite3, hashlib, secrets, html, os, calendar
 from datetime import date, datetime, timedelta
 
 BASE=os.path.dirname(os.path.abspath(__file__)); DB=os.path.join(BASE,'edziennik.sqlite3')
-HOST='127.0.0.1'; PORT=8000; SESSIONS={}
+HOST=os.environ.get('HOST', '0.0.0.0'); PORT=int(os.environ.get('PORT', '8000')); SESSIONS={}
 
 SCHEMA='''
 PRAGMA foreign_keys=ON;
