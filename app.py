@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Super dziennik 4.5 - public-ready demo, stdlib only."""
+"""Super dziennik 4.6 - public-ready demo, stdlib only."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from http import cookies
@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS meetings(id INTEGER PRIMARY KEY AUTOINCREMENT,school_
 CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY AUTOINCREMENT,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,weekday INTEGER NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,room TEXT DEFAULT '',FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS lesson_topics(id INTEGER PRIMARY KEY AUTOINCREMENT,lesson_id INTEGER NOT NULL,date TEXT NOT NULL,topic TEXT NOT NULL,UNIQUE(lesson_id,date),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,recipient_id INTEGER NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,read_at TEXT);
+CREATE TABLE IF NOT EXISTS calendar_events(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,title TEXT NOT NULL,date TEXT NOT NULL,time TEXT DEFAULT '',location TEXT DEFAULT '',description TEXT DEFAULT '',created_by INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS tests(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,type TEXT NOT NULL,name TEXT NOT NULL,date TEXT NOT NULL,time TEXT DEFAULT '',description TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
 '''
 
 def connect():
@@ -111,15 +113,15 @@ def nav_items(role,path):
     base=[('/dashboard','Pulpit','▦'),('/schedule','Plan tygodniowy','▤'),('/calendar','Kalendarz','◷'),('/attendance','Frekwencja','✓'),('/grades','Oceny' if role=='student' else 'Oceny i średnie','★'),('/announcements','Komunikaty','!'),('/messages','Wiadomości','✉')]
     if role=='student': base.insert(5,('/my-notes','Uwagi i pochwały','✦'))
     if role in ('admin','teacher'): base.insert(1,('/classes','Klasy','♟'))
-    if role=='admin': base += [('/users','Użytkownicy','♙'),('/lessons','Edytor planu','✎'),('/subjects','Przedmioty','A'),('/school','Szkoła','⌂'),('/admins','Administratorzy','⚙')]
-    elif role=='teacher': base += [('/lessons','Plan lekcji','✎')]
+    if role=='admin': base += [('/users','Użytkownicy','♙'),('/lessons','Edytor planu','✎'),('/subjects','Przedmioty','A'),('/school','Szkoła','⌂'),('/admins','Administratorzy','⚙'),('/tests','Sprawdziany','◆')]
+    elif role=='teacher': base += [('/lessons','Plan lekcji','✎'),('/tests','Sprawdziany','◆')]
     return ''.join(f"<a class=\"{'active' if path==p else ''}\" href=\"{p}\" aria-label=\"{label}\"><span>{ico}</span><span class=\"nav-label\">{label}</span></a>" for p,label,ico in base)
 
 def layout(title,body,u=None,path=''):
     if not u: return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title><style>{CSS}</style></head><body>{body}</body></html>"
     role={'admin':'Administrator','teacher':'Nauczyciel','student':'Uczeń'}[u['role']]
     mobile_nav=nav_items(u['role'],path)
-    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · Super dziennik 4.5</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.5</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
+    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · Super dziennik 4.6</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.5</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
 def login_page(msg=''):
     body=f"<!-- legacy compatibility: 4.0 --> <div class='login'><div class='loginbox'><div class='logo'>Super dziennik <span>4.5</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
     return layout('Logowanie',body)
@@ -340,7 +342,7 @@ def lesson_detail_for_date(u,c,l,day):
         rows += f"<tr><td><b>{esc(st['full_name'])}</b></td><td><select name='status_{st['id']}'><option value='' {'selected' if not cs else ''}>-- brak wpisu --</option><option value='present' {'selected' if cs=='present' else ''}>Obecny</option><option value='absent' {'selected' if cs=='absent' else ''}>Nieobecny</option><option value='late' {'selected' if cs=='late' else ''}>Spóźnienie</option><option value='excused' {'selected' if cs=='excused' else ''}>Usprawiedliwiona nieobecność</option><option value='late_excused' {'selected' if cs=='late_excused' else ''}>Spóźnienie usprawiedliwione</option><option value='excused_present' {'selected' if cs=='excused_present' else ''}>Nieobecność usprawiedliwiona</option></select></td><td><input name='comment_{st['id']}' value='{esc(cc)}' placeholder='Komentarz'></td></tr>"
     grade_rows=''.join(f"<option value='{st['id']}'>{esc(st['full_name'])}</option>" for st in students)
     note_rows=grade_rows
-    body=f"<div class=hero><div><h1>{esc(l['subject'])}</h1><div class=muted>{esc(l['class_name'])} · {day.strftime('%d.%m.%Y')} · {esc(l['start_time'])}–{esc(l['end_time'])}</div></div></div><div class=grid><div class='card col12'><h3>Temat lekcji</h3><form class=form method=post action='/lesson/{l['id']}/topic'><input type=date name=date value='{day.isoformat()}'><input name=topic value='{esc(topic)}' placeholder='Wpisz temat lekcji' required><button class=btn>Zapisz temat</button></form></div><div class='card col12'><h3>Frekwencja na tej lekcji</h3><form class=form method=post action='/lesson/{l['id']}/attendance'><input type=hidden name=date value='{day.isoformat()}'><table class=table><tr><th>Uczeń</th><th>Status</th><th>Komentarz</th></tr>{rows}</table><button class=btn>Zapisz frekwencję</button></form><p class=muted>Spóźnienie jest liczone jako 100% frekwencji.</p></div><div class='card col6'><h3>Dodaj ocenę</h3><form class=form method=post action='/lesson/{l['id']}/grade'><input type=hidden name=subject_id value='{l['subject_id']}'><input type=hidden name=class_id value='{l['class_id']}'><input type=hidden name=date value='{day.isoformat()}'><select name=student_id required>{grade_rows}</select><input name=value placeholder='Ocena, np. 5+' required><div class=row><input name=weight type=number step=.5 min=.5 value='1'><input name=category value='Ocena'></div><input name=comment placeholder='Komentarz'><button class=btn>Dodaj ocenę</button></form></div><div class='card col6'><h3>Dodaj pochwałę / uwagę</h3><form class=form method=post action='/lesson/{l['id']}/note'><input type=hidden name=date value='{day.isoformat()}'><select name=student_id required>{note_rows}</select><select name=positive><option value='1'>Pochwała</option><option value='0'>Uwaga</option></select><textarea name=text placeholder='Treść wpisu' required></textarea><button class=btn>Dodaj wpis</button></form></div></div>"
+    body=f"<div class=hero><div><h1>{esc(l['subject'])}</h1><div class=muted>{esc(l['class_name'])} · {day.strftime('%d.%m.%Y')} · {esc(l['start_time'])}–{esc(l['end_time'])}</div></div></div><div class=grid><div class='card col12'><h3>Temat lekcji</h3><form class=form method=post action='/lesson/{l['id']}/topic'><input type=date name=date value='{day.isoformat()}'><input name=topic value='{esc(topic)}' placeholder='Wpisz temat lekcji' required><div><button class=btn>Zapisz temat</button> <a class='btn gray' href='/tests?class_id={l['class_id']}&subject_id={l['subject_id']}&date={day.isoformat()}'>Zaplanuj sprawdzian</a></div></form></div><div class='card col12'><h3>Frekwencja na tej lekcji</h3><form class=form method=post action='/lesson/{l['id']}/attendance'><input type=hidden name=date value='{day.isoformat()}'><table class=table><tr><th>Uczeń</th><th>Status</th><th>Komentarz</th></tr>{rows}</table><button class=btn>Zapisz frekwencję</button></form><p class=muted>Spóźnienie jest liczone jako 100% frekwencji.</p></div><div class='card col6'><h3>Dodaj ocenę</h3><form class=form method=post action='/lesson/{l['id']}/grade'><input type=hidden name=subject_id value='{l['subject_id']}'><input type=hidden name=class_id value='{l['class_id']}'><input type=hidden name=date value='{day.isoformat()}'><select name=student_id required>{grade_rows}</select><input name=value placeholder='Ocena, np. 5+' required><div class=row><input name=weight type=number step=.5 min=.5 value='1'><input name=category value='Ocena'></div><input name=comment placeholder='Komentarz'><select name=behavior_value><option value=''>Bez oceny z zachowania</option><option>Wzorowe</option><option>Bardzo dobre</option><option>Dobre</option><option>Poprawne</option><option>Nieodpowiednie</option><option>Naganne</option></select><input name=behavior_comment placeholder='Komentarz do zachowania (opcjonalnie)'><button class=btn>Dodaj ocenę</button></form></div><div class='card col6'><h3>Dodaj pochwałę / uwagę</h3><form class=form method=post action='/lesson/{l['id']}/note'><input type=hidden name=date value='{day.isoformat()}'><select name=student_id required>{note_rows}</select><select name=positive><option value='1'>Pochwała</option><option value='0'>Uwaga</option></select><textarea name=text placeholder='Treść wpisu' required></textarea><button class=btn>Dodaj wpis</button></form></div></div>"
     return layout('Lekcja',body,u,'/schedule')
 
 def lessons_page(u,c):
@@ -362,17 +364,38 @@ def edit_lesson(u,c,lid):
     body="<div class=hero><div><h1>Edytuj lekcję</h1><div class=muted>%s · %s</div></div></div><div class=card><form class=form method=post action='/lesson/%s/edit'><div class=row><select name=class_id>%s</select><select name=subject_id>%s</select></div><div class=row><select name=teacher_id>%s</select><select name=weekday>%s</select></div><div class=row><input name=start_time type=time value='%s'><input name=end_time type=time value='%s'></div><input name=room value='%s' placeholder='Sala'><button class=btn>Zapisz zmiany</button></form></div>"%(esc(l['subject']),esc(l['class_name']),lid,opts(classes,'id','name',l['class_id']),opts(subjects,'id','name',l['subject_id']),opts(teachers,'id','full_name',l['teacher_id']),''.join("<option value='%s'%s>%s</option>"%(i,' selected' if i==l['weekday'] else '',days[i]) for i in range(1,6)),esc(l['start_time']),esc(l['end_time']),esc(l['room']))
     return layout('Edycja lekcji',body,u,'/lessons')
 def calendar_page(u,c):
-    y,m=date.today().year,date.today().month; meetings=q(c,'SELECT * FROM meetings WHERE school_id=? ORDER BY date',(u['school_id'],)); anns=q(c,'SELECT * FROM announcements WHERE school_id=? ORDER BY created_at',(u['school_id'],)); events={}
+    y,m=date.today().year,date.today().month
+    meetings=q(c,'SELECT * FROM meetings WHERE school_id=? ORDER BY date',(u['school_id'],))
+    anns=q(c,'SELECT * FROM announcements WHERE school_id=? ORDER BY created_at',(u['school_id'],))
+    custom=q(c,'SELECT * FROM calendar_events WHERE school_id=? ORDER BY date,time,id',(u['school_id'],))
+    events={}
     for x in meetings: events.setdefault(x['date'][:10],[]).append(('Spotkanie',x['title']))
     for x in anns: events.setdefault(x['created_at'][:10],[]).append(('Komunikat',x['title']))
+    for x in custom: events.setdefault(x['date'],[]).append(('Wydarzenie',x['title']))
     cal=calendar.monthcalendar(y,m); names=['Pn','Wt','Śr','Cz','Pt','Sb','Nd']; out=''.join("<div class=cal-head>%s</div>"%n for n in names)
     for week in cal:
         for d in week:
             if not d: out+='<div class="day mutedday"></div>'; continue
             ds=f'{y:04d}-{m:02d}-{d:02d}'; cls='day today' if ds==date.today().isoformat() else 'day'; ev=''.join("<span class=event>%s: %s</span>"%(esc(a),esc(b)) for a,b in events.get(ds,[])); out+="<div class='%s'><div class=daynum>%s</div>%s</div>"%(cls,d,ev)
-    upcoming=q(c,'SELECT * FROM meetings WHERE school_id=? AND date>=? ORDER BY date LIMIT 8',(u['school_id'],datetime.now().strftime('%Y-%m-%d')))
+    upcoming=q(c,'SELECT * FROM calendar_events WHERE school_id=? AND date>=? ORDER BY date,time,id LIMIT 10',(u['school_id'],date.today().isoformat()))
+    add="" if u['role'] not in ('admin','teacher') else "<div class='card col12'><h3>Dodaj wydarzenie</h3><form class=form method=post action=/calendar/event><div class=row><input name=title placeholder='Nazwa wydarzenia' required><input name=date type=date value='%s' required></div><div class=row><input name=time type=time><input name=location placeholder='Miejsce'></div><textarea name=description placeholder='Opis wydarzenia'></textarea><button class=btn>Dodaj wydarzenie</button></form></div>"%date.today().isoformat()
     months=['','Styczeń','Luty','Marzec','Kwiecień','Maj','Czerwiec','Lipiec','Sierpień','Wrzesień','Październik','Listopad','Grudzień']
-    return layout('Kalendarz',"<div class=hero><div><h1>Kalendarz</h1><div class=muted>%s %s</div></div></div><div class=grid><div class=card col8><div class=calendar>%s</div></div><div class=card col4><h3>Nadchodzące wydarzenia</h3>%s</div></div>"%(months[m],y,out,''.join("<div class=notice><b>%s</b><br>%s<br>%s</div>"%(esc(x['title']),esc(x['date']),esc(x['location'])) for x in upcoming) or '<div class=empty>Brak wydarzeń.</div>'),u,'/calendar')
+    return layout('Kalendarz',"<div class=hero><div><h1>Kalendarz</h1><div class=muted>%s %s</div></div></div><div class=grid>%s<div class=card col8><div class=calendar>%s</div></div><div class=card col4><h3>Nadchodzące wydarzenia</h3>%s</div></div>"%(months[m],y,add,out,''.join("<div class=notice><b>%s</b><br>%s%s<br>%s</div>"%(esc(x['title']),esc(x['date']),(' · '+esc(x['time'])) if x['time'] else '',esc(x['location'] or x['description'] or '')) for x in upcoming) or '<div class=empty>Brak wydarzeń.</div>'),u,'/calendar')
+
+
+def tests_page(u,c):
+    if u['role']=='student':
+        rows=q(c,'SELECT t.*,cl.name class_name,s.name subject FROM tests t JOIN classes cl ON cl.id=t.class_id JOIN subjects s ON s.id=t.subject_id WHERE t.school_id=? AND t.class_id=(SELECT class_id FROM students WHERE user_id=?) ORDER BY t.date,t.time,t.id',(u['school_id'],u['id']))
+        html=''.join(f"<div class='card'><span class=badge>{esc(t['type'])}</span><h3>{esc(t['name'])}</h3><p><b>{esc(t['subject'])}</b> · {esc(t['class_name'])}</p><p><b>Data:</b> {esc(t['date'])}{(' · '+esc(t['time'])) if t['time'] else ''}</p>{('<p>'+esc(t['description'])+'</p>') if t['description'] else ''}</div>" for t in rows) or '<div class=empty>Brak zaplanowanych sprawdzianów.</div>'
+        return layout('Sprawdziany',f"<div class=hero><div><h1>Sprawdziany</h1><div class=muted>Zaplanowane formy sprawdzania wiedzy.</div></div></div><div class=grid>{html}</div>",u,'/tests')
+    classes=q(c,'SELECT id,name FROM classes WHERE school_id=? ORDER BY name',(u['school_id'],)); subjects=q(c,'SELECT id,name FROM subjects WHERE school_id=? ORDER BY name',(u['school_id'],))
+    if u['role']=='teacher':
+        classes=q(c,'SELECT id,name FROM classes WHERE school_id=? AND (teacher_id=? OR id IN (SELECT class_id FROM lessons WHERE teacher_id=?)) ORDER BY name',(u['school_id'],u['id'],u['id']))
+    rows=q(c,'SELECT t.*,cl.name class_name,s.name subject,u.full_name teacher FROM tests t JOIN classes cl ON cl.id=t.class_id JOIN subjects s ON s.id=t.subject_id JOIN users u ON u.id=t.teacher_id WHERE t.school_id=? ORDER BY t.date,t.time,t.id',(u['school_id'],))
+    form=f"<div class='card col5'><h3>Zaplanuj sprawdzian</h3><form class=form method=post action=/test><select name=type required><option>Sprawdzian</option><option>Kartkówka</option><option>Odpowiedź ustna</option><option>Egzamin</option><option>Egzamin próbny</option></select><input name=name placeholder='Nazwa sprawdzianu' required><select name=class_id required>{opts(classes,'id','name')}</select><select name=subject_id required>{opts(subjects,'id','name')}</select><div class=row><input name=date type=date value='{date.today().isoformat()}' required><input name=time type=time></div><textarea name=description placeholder='Informacje / zakres materiału'></textarea><button class=btn>Zaplanuj sprawdzian</button></form></div>"
+    table='<div class="card col7"><h3>Zaplanowane</h3><table class=table><tr><th>Typ</th><th>Nazwa</th><th>Klasa</th><th>Przedmiot</th><th>Data</th></tr>'+''.join(f"<tr><td>{esc(t['type'])}</td><td><b>{esc(t['name'])}</b></td><td>{esc(t['class_name'])}</td><td>{esc(t['subject'])}</td><td>{esc(t['date'])}{(' '+esc(t['time'])) if t['time'] else ''}</td></tr>" for t in rows)+'</table></div>'
+    return layout('Sprawdziany',f"<div class=hero><div><h1>Sprawdziany</h1><div class=muted>Planuj sprawdziany, kartkówki, odpowiedzi ustne i egzaminy.</div></div></div><div class=grid>{form}{table}</div>",u,'/tests')
+
 def admins_page(u,c):
     if u['role'] != 'admin':
         return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u,'/admins')
@@ -497,6 +520,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/my-notes': out=my_notes_page(u,c)
             elif path=='/messages': out=messages_page(u,c)
             elif path=='/lessons': out=lessons_page(u,c)
+            elif path=='/tests': out=tests_page(u,c)
             elif path.startswith('/grade/') and path.endswith('/edit'): out=edit_grade(u,c,int(path.split('/')[2]))
             elif path.startswith('/attendance/') and path.endswith('/edit'): out=edit_attendance(u,c,int(path.split('/')[2]))
             elif path.startswith('/note/') and path.endswith('/edit'): out=edit_note(u,c,int(path.split('/')[2]))
@@ -640,6 +664,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not a or not can_manage_student(c,u,a['student_id']): raise ValueError('Brak uprawnień do tej frekwencji.')
                 c.execute('DELETE FROM attendance WHERE id=?',(aid,))
             elif path=='/message': c.execute('INSERT INTO messages(school_id,sender_id,recipient_id,subject,body) VALUES(?,?,?,?,?)',(u['school_id'],u['id'],data['recipient_id'],data['subject'],data['body']))
+            elif path=='/calendar/event' and u['role'] in ('admin','teacher'):
+                title=data.get('title','').strip(); evdate=data.get('date','').strip()
+                if not title or not evdate: raise ValueError('Nazwa i data wydarzenia są wymagane.')
+                c.execute('INSERT INTO calendar_events(school_id,title,date,time,location,description,created_by) VALUES(?,?,?,?,?,?,?)',(u['school_id'],title,evdate,data.get('time',''),data.get('location',''),data.get('description',''),u['id']))
+            elif path=='/test' and u['role'] in ('admin','teacher'):
+                typ=data.get('type','Sprawdzian'); allowed=['Sprawdzian','Kartkówka','Odpowiedź ustna','Egzamin','Egzamin próbny']
+                if typ not in allowed: raise ValueError('Nieprawidłowy typ sprawdzianu.')
+                cid=int(data['class_id']); subid=int(data['subject_id'])
+                cl=one(c,'SELECT id FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
+                sub=one(c,'SELECT id FROM subjects WHERE id=? AND school_id=?',(subid,u['school_id']))
+                if not cl or not sub: raise ValueError('Nieprawidłowa klasa lub przedmiot.')
+                if u['role']=='teacher' and not one(c,'SELECT id FROM lessons WHERE class_id=? AND subject_id=? AND teacher_id=? UNION SELECT id FROM classes WHERE id=? AND teacher_id=?',(cid,subid,u['id'],cid,u['id'])): raise ValueError('Nie możesz planować sprawdzianu dla tej klasy/przedmiotu.')
+                c.execute('INSERT INTO tests(school_id,class_id,subject_id,teacher_id,type,name,date,time,description) VALUES(?,?,?,?,?,?,?,?,?)',(u['school_id'],cid,subid,u['id'],typ,data['name'].strip(),data['date'],data.get('time',''),data.get('description','')))
             elif path=='/announcement' and u['role'] in ('admin','teacher'): c.execute('INSERT INTO announcements(school_id,title,body,target) VALUES(?,?,?,?)',(u['school_id'],data['title'],data['body'],data.get('target','Wszyscy')))
             elif path=='/user' and u['role']=='admin':
                 role=data.get('role','student')
@@ -651,7 +688,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith('/admin/') and path.endswith('/delete') and u['role']=='admin':
                 aid=int(path.split('/')[2])
                 if aid==u['id']: raise ValueError('Nie można usunąć własnego konta administratora.')
+                target_admin=one(c,"SELECT id FROM users WHERE id=? AND role='admin' AND school_id=?",(aid,u['school_id']))
+                if not target_admin: raise ValueError('Nie znaleziono administratora.')
+                c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(aid,aid))
+                c.execute('UPDATE classes SET teacher_id=NULL WHERE teacher_id=?',(aid,))
                 c.execute("DELETE FROM users WHERE id=? AND role='admin' AND school_id=?",(aid,u['school_id']))
+                if c.total_changes < 1: raise ValueError('Nie udało się usunąć administratora.')
             elif path=='/class' and u['role']=='admin': c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(u['school_id'],data['name'],int(data.get('year','1')),data.get('teacher_id') or None))
             elif path.startswith('/class/') and path.endswith('/delete') and u['role']=='admin':
                 cid=int(path.split('/')[2]); cls=one(c,'SELECT id FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
@@ -682,6 +724,8 @@ class Handler(BaseHTTPRequestHandler):
                 sid=int(data['student_id']); st=one(c,'SELECT id FROM students WHERE id=? AND class_id=?',(sid,l['class_id']))
                 if not st: raise ValueError('Uczeń nie należy do tej klasy.')
                 c.execute('INSERT INTO grades(student_id,subject_id,teacher_id,value,weight,category,comment,lesson_id,date) VALUES(?,?,?,?,?,?,?,?,?)',(sid,l['subject_id'],u['id'],data['value'],float(data.get('weight','1') or 1),data.get('category','Ocena'),data.get('comment',''),lid,data.get('date') or date.today().isoformat()))
+                if data.get('behavior_value'):
+                    c.execute('INSERT INTO behavior_grades(student_id,teacher_id,value,comment,date) VALUES(?,?,?,?,?)',(sid,u['id'],data['behavior_value'],data.get('behavior_comment',''),data.get('date') or date.today().isoformat()))
             elif path.startswith('/lesson/') and path.endswith('/note') and u['role'] in ('admin','teacher'):
                 lid=int(path.split('/')[2]); l=one(c,'SELECT l.class_id,l.teacher_id,l.subject_id,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
                 if not l or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień do tej lekcji.')
@@ -712,6 +756,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith('/grade'): target='/grades'
         elif path.startswith('/attendance'): target='/attendance'
         elif path.startswith('/lesson/'): target='/lesson/'+path.split('/')[2]
+        elif path=='/calendar/event': target='/calendar'
+        elif path=='/test': target='/tests'
         elif path.startswith('/lesson'): target='/lessons'
         elif path.startswith('/student/') or path=='/class': target='/classes'
         elif path=='/user' or path.startswith('/user/') or path=='/teacher' or path.startswith('/teacher/') or path.startswith('/school'): target='/users' if path.startswith('/user') or path.startswith('/teacher') else '/school'
@@ -719,4 +765,4 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(target)
 
 if __name__=='__main__':
-    init(); print(f'Super dziennik 4.5: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+    init(); print(f'Super dziennik 4.6: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
