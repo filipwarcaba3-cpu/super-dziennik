@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Super dziennik 4.0 - lesson-centered school journal demo, stdlib only."""
+"""Super dziennik 4.3 - public-ready demo, stdlib only."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from http import cookies
-import sqlite3, hashlib, secrets, html, os, calendar
+import sqlite3, hashlib, secrets, html, os, calendar, hmac, time, re
 from datetime import date, datetime, timedelta
 
-BASE=os.path.dirname(os.path.abspath(__file__)); DB=os.path.join(BASE,'edziennik.sqlite3')
-HOST=os.environ.get('HOST', '0.0.0.0'); PORT=int(os.environ.get('PORT', '8000')); SESSIONS={}
+BASE=os.path.dirname(os.path.abspath(__file__))
+DATA_DIR=os.getenv('DATA_DIR') or ('/var/data' if os.path.isdir('/var/data') else os.path.join(BASE,'data'))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB=os.getenv('DATABASE_PATH', os.path.join(DATA_DIR,'edziennik.sqlite3'))
+HOST=os.getenv('HOST','0.0.0.0'); PORT=int(os.getenv('PORT','8000')); SESSION_TTL=8*60*60; CSRF_ENABLED=os.getenv('CSRF_ENABLED','1')=='1'; SESSIONS={}
 
 SCHEMA='''
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS schools(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,address TEXT DEFAULT '',email TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,school_id INTEGER,full_name TEXT NOT NULL,email TEXT DEFAULT '',phone TEXT DEFAULT '',active INTEGER DEFAULT 1,FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,school_id INTEGER,full_name TEXT NOT NULL,email TEXT DEFAULT '',phone TEXT DEFAULT '',info TEXT DEFAULT '',active INTEGER DEFAULT 1,FOREIGN KEY(school_id) REFERENCES schools(id));
 CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,name TEXT NOT NULL,year INTEGER DEFAULT 1,teacher_id INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS students(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,class_id INTEGER,guardian_name TEXT DEFAULT '',guardian_email TEXT DEFAULT '',guardian_phone TEXT DEFAULT '',FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(class_id) REFERENCES classes(id));
 CREATE TABLE IF NOT EXISTS subjects(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,name TEXT NOT NULL,short_name TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
 CREATE TABLE IF NOT EXISTS enrollments(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,UNIQUE(student_id,subject_id),FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
 CREATE TABLE IF NOT EXISTS grades(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,weight REAL DEFAULT 1,category TEXT DEFAULT 'Ocena',comment TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS behavior_grades(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,comment TEXT DEFAULT '',date TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,date TEXT NOT NULL,status TEXT NOT NULL,subject_id INTEGER,lesson_id INTEGER,comment TEXT DEFAULT '',FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
 CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,text TEXT NOT NULL,positive INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
 CREATE TABLE IF NOT EXISTS excuses(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,date_from TEXT NOT NULL,date_to TEXT NOT NULL,reason TEXT DEFAULT '',status TEXT DEFAULT 'Oczekuje',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE);
@@ -30,8 +34,23 @@ CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,school_
 '''
 
 def connect():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
-def hpw(p): return hashlib.sha256(('edemo:'+p).encode()).hexdigest()
+    c=sqlite3.connect(DB, timeout=20, check_same_thread=False); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
+
+def hpw_legacy(p): return hashlib.sha256(('edemo:'+p).encode()).hexdigest()
+def hpw(p):
+    salt=secrets.token_bytes(16)
+    digest=hashlib.pbkdf2_hmac('sha256', p.encode('utf-8'), salt, 210_000)
+    return 'pbkdf2$210000$%s$%s' % (salt.hex(), digest.hex())
+def verify_password(stored, password):
+    if stored.startswith('pbkdf2$'):
+        try:
+            _, rounds, salt_hex, digest_hex=stored.split('$',3)
+            digest=hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt_hex), int(rounds))
+            return hmac.compare_digest(digest.hex(), digest_hex)
+        except Exception:
+            return False
+    return hmac.compare_digest(stored, hpw_legacy(password))
+
 def one(c,sql,args=()): return c.execute(sql,args).fetchone()
 def q(c,sql,args=()): return c.execute(sql,args).fetchall()
 def esc(x): return html.escape(str(x or ''))
@@ -44,6 +63,8 @@ def init():
     # Migration for existing demo databases: bind attendance to a concrete lesson occurrence.
     cols=[r['name'] for r in q(c,'PRAGMA table_info(attendance)')]
     if 'lesson_id' not in cols: c.execute('ALTER TABLE attendance ADD COLUMN lesson_id INTEGER')
+    ucols=[r['name'] for r in q(c,'PRAGMA table_info(users)')]
+    if 'info' not in ucols: c.execute('ALTER TABLE users ADD COLUMN info TEXT DEFAULT ''')
     gcols=[r['name'] for r in q(c,'PRAGMA table_info(grades)')]
     if 'lesson_id' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN lesson_id INTEGER')
     if 'date' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN date TEXT')
@@ -81,26 +102,26 @@ def init():
 
 CSS='''
 :root{--bg:#f5f7fb;--panel:#fff;--ink:#182235;--muted:#718096;--line:#e7eaf0;--brand:#4f46e5;--brand2:#7c3aed;--dark:#111827;--green:#059669;--red:#dc2626;--amber:#d97706;--orange:#f97316;--burgundy:#7f1d3b;--shadow:0 12px 35px rgba(31,41,55,.07)}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}.app{display:flex;min-height:100vh}.side{width:250px;background:linear-gradient(180deg,#111827,#1f2937);color:#e5e7eb;position:fixed;inset:0 auto 0 0;padding:22px 15px;display:flex;flex-direction:column;z-index:5}.logo{font-size:20px;font-weight:800;padding:8px 12px 24px}.logo span{color:#a5b4fc}.who{background:#ffffff0b;border:1px solid #ffffff14;border-radius:14px;padding:12px;margin-bottom:18px}.who b{display:block;color:#fff}.who small{color:#9ca3af}.nav a{display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;padding:10px 12px;margin:3px 0;text-decoration:none;border-radius:10px;color:#cbd5e1;cursor:pointer;user-select:none}.nav a span{width:22px;min-width:22px;text-align:center;pointer-events:none}.nav a>*{pointer-events:none}.nav .nav-label{display:block;flex:1}.nav a:hover,.nav a.active{background:#ffffff14;color:#fff}.side .logout{margin-top:auto}.logout-link{background:#ffffff08;border:1px solid #ffffff12}.logout-link:hover{background:#dc262633!important;color:#fff!important}.main{margin-left:250px;width:calc(100% - 250px)}.top{height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;padding:0 30px;position:sticky;top:0;z-index:3}.top h2{font-size:18px;margin:0}.content{max-width:1450px;margin:0 auto;padding:28px}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:15px;margin-bottom:22px}.hero h1{font-size:30px;line-height:1.1;margin:0 0 5px}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.col12{grid-column:span 12}.col8{grid-column:span 8}.col6{grid-column:span 6}.col4{grid-column:span 4}.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:19px;box-shadow:var(--shadow)}.card h3{margin:0 0 12px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:18px;border:1px solid var(--line);border-radius:16px;background:#fff}.stat .num{font-size:28px;font-weight:800;margin-top:5px}.stat .label{color:var(--muted)}.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:10px;background:var(--brand);color:#fff;text-decoration:none;padding:9px 13px;cursor:pointer;font-weight:650}.btn.gray{background:#eef2f7;color:#374151}.btn.red{background:var(--red)}.btn.green{background:var(--green)}.btn.amber{background:var(--amber)}.btn.sm{padding:6px 9px;font-size:12px}.form{display:grid;gap:10px}.form input,.form select,.form textarea{width:100%;padding:10px 11px;border:1px solid #d8dde7;border-radius:10px;background:#fff;font:inherit}.form textarea{min-height:95px}.form .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}.table th{font-size:12px;text-transform:uppercase;color:var(--muted);letter-spacing:.03em}.badge{display:inline-block;padding:4px 8px;border-radius:99px;background:#eef2ff;color:#3730a3;font-size:12px}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.notice{padding:12px 14px;border-radius:12px;background:#eef2ff;margin-bottom:10px}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.cal-head{font-size:12px;color:var(--muted);text-align:center;font-weight:700;padding:5px}.day{min-height:95px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px}.day.mutedday{background:#fafafa;color:#b0b7c3}.day.today{outline:2px solid #818cf8}.daynum{font-weight:800}.event{display:block;margin-top:5px;padding:4px 6px;border-radius:7px;background:#eef2ff;color:#3730a3;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.schedule{display:grid;grid-template-columns:70px repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);overflow:hidden;border-radius:14px}.schedule>div{background:#fff;padding:9px;min-height:58px}.schedule .head{font-weight:800;text-align:center;background:#f8fafc}.lesson{display:block;border-left:4px solid var(--brand);border-radius:7px;background:#f4f3ff!important;text-decoration:none;color:inherit}.lesson small{display:block;margin-top:5px;color:var(--muted)}.lesson-present{background:#ecfdf5!important;border-left-color:var(--green)}.lesson-absent{background:#fef2f2!important;border-left-color:var(--red)}.lesson-late{background:#fffbeb!important;border-left-color:var(--amber)}.lesson-excused{background:#eef2ff!important;border-left-color:var(--brand)}.lesson-late-excused{background:#fff7ed!important;border-left-color:var(--orange)}.lesson-excused-present{background:#fdf2f8!important;border-left-color:var(--burgundy)}.grade-board{display:flex;flex-wrap:wrap;gap:16px;align-items:stretch}.grade-subject{flex:1 1 220px;min-width:220px;background:#fff;border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}.grade-subject h3{margin:0 0 4px}.grade-count{font-size:12px;color:var(--muted);margin-bottom:12px}.grade-pills{display:flex;flex-wrap:wrap;gap:9px}.grade-pill{min-width:54px;padding:10px 12px;border-radius:12px;background:#f3f4f6;text-align:center}.grade-pill b{font-size:20px;display:block}.note-row{width:100%;margin-bottom:12px;padding:16px 18px;border-radius:14px;border:1px solid var(--line);background:#fff}.note-title{font-weight:800}.note-negative{border-left:5px solid var(--red)}.note-negative .note-text{color:var(--red)}.note-positive{border-left:5px solid var(--green)}.note-positive .note-text{color:var(--green)}.status-badge-present{background:#d1fae5;color:#065f46}.status-badge-absent{background:#fee2e2;color:#991b1b}.status-badge-late{background:#fef3c7;color:#92400e}.status-badge-late_excused{background:#ffedd5;color:#9a3412}.status-badge-excused_present{background:#fce7f3;color:#831843}.present-b{background:#d1fae5;color:#065f46}.absent-b{background:#fee2e2;color:#991b1b}.late-b{background:#fef3c7;color:#92400e}.status-chip{display:inline-block;padding:8px 12px;border-radius:999px;font-weight:700}.status-chip.present{background:#d1fae5;color:#065f46}.status-chip.absent{background:#fee2e2;color:#991b1b}.status-chip.late{background:#fef3c7;color:#92400e}.status-chip.excused{background:#e0e7ff;color:#3730a3}.status-chip.late_excused{background:#ffedd5;color:#9a3412}.status-chip.excused_present{background:#fce7f3;color:#831843}.login{min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top left,#e0e7ff,#f8fafc 55%)}.loginbox{width:min(430px,92vw);background:#fff;padding:30px;border:1px solid var(--line);border-radius:22px;box-shadow:0 20px 60px #0001}.loginbox h1{margin-top:0}.pillrow{display:flex;gap:8px;flex-wrap:wrap}.empty{padding:28px;text-align:center;color:var(--muted)}.mobile{display:none}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}.app{display:flex;min-height:100vh}.side{width:250px;background:linear-gradient(180deg,#111827,#1f2937);color:#e5e7eb;position:fixed;inset:0 auto 0 0;padding:22px 15px;display:flex;flex-direction:column;z-index:5}.logo{font-size:20px;font-weight:800;padding:8px 12px 24px}.logo span{color:#a5b4fc}.who{background:#ffffff0b;border:1px solid #ffffff14;border-radius:14px;padding:12px;margin-bottom:18px}.who b{display:block;color:#fff}.who small{color:#9ca3af}.nav a{display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;padding:10px 12px;margin:3px 0;text-decoration:none;border-radius:10px;color:#cbd5e1;cursor:pointer;user-select:none}.nav a span{width:22px;min-width:22px;text-align:center;pointer-events:none}.nav a>*{pointer-events:none}.nav .nav-label{display:block;flex:1}.nav a:hover,.nav a.active{background:#ffffff14;color:#fff}.side .logout{margin-top:auto}.logout-link{background:#ffffff08;border:1px solid #ffffff12}.logout-link:hover{background:#dc262633!important;color:#fff!important}.main{margin-left:250px;width:calc(100% - 250px)}.top{height:72px;background:#fff;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;padding:0 30px;position:sticky;top:0;z-index:3}.top h2{font-size:18px;margin:0}.content{max-width:1450px;margin:0 auto;padding:28px}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:15px;margin-bottom:22px}.hero h1{font-size:30px;line-height:1.1;margin:0 0 5px}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.col12{grid-column:span 12}.col8{grid-column:span 8}.col6{grid-column:span 6}.col4{grid-column:span 4}.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:19px;box-shadow:var(--shadow)}.card h3{margin:0 0 12px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stat{padding:18px;border:1px solid var(--line);border-radius:16px;background:#fff}.stat .num{font-size:28px;font-weight:800;margin-top:5px}.stat .label{color:var(--muted)}.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:10px;background:var(--brand);color:#fff;text-decoration:none;padding:9px 13px;cursor:pointer;font-weight:650}.btn.gray{background:#eef2f7;color:#374151}.btn.red{background:var(--red)}.btn.green{background:var(--green)}.btn.amber{background:var(--amber)}.btn.sm{padding:6px 9px;font-size:12px}.form{display:grid;gap:10px}.form input,.form select,.form textarea{width:100%;padding:10px 11px;border:1px solid #d8dde7;border-radius:10px;background:#fff;font:inherit}.form textarea{min-height:95px}.form .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}.table th{font-size:12px;text-transform:uppercase;color:var(--muted);letter-spacing:.03em}.badge{display:inline-block;padding:4px 8px;border-radius:99px;background:#eef2ff;color:#3730a3;font-size:12px}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.notice{padding:12px 14px;border-radius:12px;background:#eef2ff;margin-bottom:10px}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.cal-head{font-size:12px;color:var(--muted);text-align:center;font-weight:700;padding:5px}.day{min-height:95px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px}.day.mutedday{background:#fafafa;color:#b0b7c3}.day.today{outline:2px solid #818cf8}.daynum{font-weight:800}.event{display:block;margin-top:5px;padding:4px 6px;border-radius:7px;background:#eef2ff;color:#3730a3;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.schedule{display:grid;grid-template-columns:70px repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);overflow:hidden;border-radius:14px}.schedule>div{background:#fff;padding:9px;min-height:58px}.schedule .head{font-weight:800;text-align:center;background:#f8fafc}.lesson{display:block;border-left:4px solid var(--brand);border-radius:7px;background:#f4f3ff;text-decoration:none;color:inherit}.lesson small{display:block;margin-top:5px;color:var(--muted)}.lesson-present{background:#ecfdf5!important;border-left-color:var(--green)}.lesson-absent{background:#fef2f2!important;border-left-color:var(--red)}.lesson-late{background:#fffbeb!important;border-left-color:var(--amber)}.lesson-excused{background:#eef2ff!important;border-left-color:var(--brand)}.lesson-late-excused{background:#fff7ed!important;border-left-color:var(--orange)}.lesson-excused-present{background:#fdf2f8!important;border-left-color:var(--burgundy)}.grade-board{display:flex;flex-wrap:wrap;gap:16px;align-items:stretch}.grade-subject{flex:1 1 220px;min-width:220px;background:#fff;border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}.grade-subject h3{margin:0 0 4px}.grade-count{font-size:12px;color:var(--muted);margin-bottom:12px}.grade-pills{display:flex;flex-wrap:wrap;gap:9px}.grade-pill{min-width:54px;padding:10px 12px;border-radius:12px;background:#f3f4f6;text-align:center}.grade-pill b{font-size:20px;display:block}.note-row{width:100%;margin-bottom:12px;padding:16px 18px;border-radius:14px;border:1px solid var(--line);background:#fff}.note-title{font-weight:800}.note-negative{border-left:5px solid var(--red)}.note-negative .note-text{color:var(--red)}.note-positive{border-left:5px solid var(--green)}.note-positive .note-text{color:var(--green)}.status-badge-present{background:#d1fae5;color:#065f46}.status-badge-absent{background:#fee2e2;color:#991b1b}.status-badge-late{background:#fef3c7;color:#92400e}.status-badge-late_excused{background:#ffedd5;color:#9a3412}.status-badge-excused_present{background:#fce7f3;color:#831843}.present-b{background:#d1fae5;color:#065f46}.absent-b{background:#fee2e2;color:#991b1b}.late-b{background:#fef3c7;color:#92400e}.status-chip{display:inline-block;padding:8px 12px;border-radius:999px;font-weight:700}.status-chip.present{background:#d1fae5;color:#065f46}.status-chip.absent{background:#fee2e2;color:#991b1b}.status-chip.late{background:#fef3c7;color:#92400e}.status-chip.excused{background:#e0e7ff;color:#3730a3}.status-chip.late_excused{background:#ffedd5;color:#9a3412}.status-chip.excused_present{background:#fce7f3;color:#831843}.login{min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top left,#e0e7ff,#f8fafc 55%)}.loginbox{width:min(430px,92vw);background:#fff;padding:30px;border:1px solid var(--line);border-radius:22px;box-shadow:0 20px 60px #0001}.loginbox h1{margin-top:0}.pillrow{display:flex;gap:8px;flex-wrap:wrap}.empty{padding:28px;text-align:center;color:var(--muted)}.mobile{display:none}.mobile-nav{display:none}.lesson-topic-missing{background:#fffbeb!important;border-left-color:var(--amber)}.lesson-topic-set{background:#ecfdf5!important;border-left-color:var(--green)}.user-info{color:#4b5563;font-size:13px}.behavior-card{border-left:5px solid var(--brand)}.behavior-value{font-size:22px;font-weight:800}.status-badge-excused{background:#e0e7ff;color:#3730a3}
 @media(max-width:1000px){.side{width:210px}.main{margin-left:210px;width:calc(100% - 210px)}.stats{grid-template-columns:repeat(2,1fr)}.col8,.col6,.col4{grid-column:span 12}}
-@media(max-width:700px){.side{display:none}.main{margin-left:0;width:100%}.mobile{display:block}.top{padding:0 16px}.content{padding:18px}.stats{grid-template-columns:1fr 1fr}.schedule{grid-template-columns:55px repeat(5,120px);overflow:auto}.calendar{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.side{display:none}.main{margin-left:0;width:100%}.mobile{display:block}.mobile-nav{display:flex;gap:6px;overflow-x:auto;padding:8px 12px;background:#111827;position:sticky;top:72px;z-index:4}.mobile-nav a{flex:0 0 auto;display:flex;gap:6px;align-items:center;padding:8px 10px;border-radius:9px;color:#e5e7eb;text-decoration:none;font-size:12px}.mobile-nav a.active{background:#ffffff18}.top{padding:0 16px}.content{padding:18px}.stats{grid-template-columns:1fr 1fr}.schedule{grid-template-columns:55px repeat(5,120px);overflow:auto}.calendar{grid-template-columns:repeat(2,1fr)}.grade-subject{min-width:190px}.table{min-width:680px}.card{overflow-x:auto}.form .row{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}}
 '''
 
 def nav_items(role,path):
     base=[('/dashboard','Pulpit','▦'),('/schedule','Plan tygodniowy','▤'),('/calendar','Kalendarz','◷'),('/attendance','Frekwencja','✓'),('/grades','Oceny' if role=='student' else 'Oceny i średnie','★'),('/announcements','Komunikaty','!'),('/messages','Wiadomości','✉')]
     if role=='student': base.insert(5,('/my-notes','Uwagi i pochwały','✦'))
-    if role in ('admin','teacher'):
-        base.insert(1,('/classes','Klasy','♟'))
-    if role=='admin': base += [('/lessons','Edytor planu','✎'),('/subjects','Przedmioty','A'),('/admins','Administratorzy','⚙')]
+    if role in ('admin','teacher'): base.insert(1,('/classes','Klasy','♟'))
+    if role=='admin': base += [('/users','Użytkownicy','♙'),('/lessons','Edytor planu','✎'),('/subjects','Przedmioty','A'),('/school','Szkoła','⌂'),('/admins','Administratorzy','⚙')]
     elif role=='teacher': base += [('/lessons','Plan lekcji','✎')]
     return ''.join(f"<a class=\"{'active' if path==p else ''}\" href=\"{p}\" aria-label=\"{label}\"><span>{ico}</span><span class=\"nav-label\">{label}</span></a>" for p,label,ico in base)
 
 def layout(title,body,u=None,path=''):
     if not u: return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title><style>{CSS}</style></head><body>{body}</body></html>"
     role={'admin':'Administrator','teacher':'Nauczyciel','student':'Uczeń'}[u['role']]
-    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)} · Super dziennik 4.0</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.0</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><section class='content'>{body}</section></main></div></body></html>"
+    mobile_nav=nav_items(u['role'],path)
+    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · Super dziennik 4.3</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.3</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
 def login_page(msg=''):
-    body=f"<div class='login'><div class='loginbox'><div class='logo'>Super dziennik <span>4.0</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
+    body=f"<!-- legacy compatibility: 4.0 --> <div class='login'><div class='loginbox'><div class='logo'>Super dziennik <span>4.3</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
     return layout('Logowanie',body)
 
 def student_id(c,u): return one(c,'SELECT id FROM students WHERE user_id=?',(u['id'],))['id']
@@ -133,11 +154,11 @@ def dash(u,c):
     return layout('Pulpit',body,u,'/dashboard')
 
 def grade_table(rows, can_edit=False):
-    head='<table class=table><tr><th>Przedmiot</th><th>Ocena</th><th>Waga</th><th>Kategoria</th><th></th></tr>'
+    head='<table class=table><tr><th>Przedmiot</th><th>Ocena</th><th>Waga</th><th>Kategoria</th><th>Zachowanie</th><th></th></tr>'
     out=[]
     for r in rows:
         action=(f"<a class='btn sm gray' href='/grade/{r['id']}/edit'>Edytuj</a> <form method=post action='/grade/{r['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć ocenę?')\"><button class='btn sm red'>Usuń</button></form>" if can_edit else '')
-        out.append(f"<tr><td>{esc(r['subject'])}</td><td><b>{esc(r['value'])}</b></td><td>{esc(r['weight'])}</td><td>{esc(r['category'])}</td><td>{action}</td></tr>")
+        out.append(f"<tr><td>{esc(r['subject'])}</td><td><b>{esc(r['value'])}</b></td><td>{esc(r['weight'])}</td><td>{esc(r['category'])}</td><td>{esc(r['behavior'] or '—') if 'behavior' in r.keys() else '—'}</td><td>{action}</td></tr>")
     return head+''.join(out)+'</table>'
 
 def grade_subject_board(rows, can_edit=False):
@@ -179,14 +200,25 @@ def student_page(u,c,sid):
         return layout('403','<div class=card><h1>403</h1><p>Uczeń może wyświetlić wyłącznie własny profil.</p></div>',u)
     if u['role'] in ('admin','teacher') and st['school_id'] != u['school_id']:
         return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień do tego ucznia.</p></div>',u)
-    grades=q(c,'SELECT g.*,s.name subject FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY g.id DESC',(sid,)); att=q(c,'SELECT a.*,s.name subject FROM attendance a LEFT JOIN subjects s ON s.id=a.subject_id WHERE a.student_id=? ORDER BY a.date DESC',(sid,)); notes=q(c,'SELECT n.*,u.full_name teacher FROM notes n JOIN users u ON u.id=n.teacher_id WHERE n.student_id=? ORDER BY n.id DESC',(sid,)); can_manage=can_manage_student(c,u,sid);
+    grades=q(c,"SELECT g.*,s.name subject,(SELECT value FROM behavior_grades bg WHERE bg.student_id=g.student_id ORDER BY bg.id DESC LIMIT 1) behavior FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY g.id DESC",(sid,)); behavior=one(c,'SELECT bg.*,u.full_name teacher FROM behavior_grades bg JOIN users u ON u.id=bg.teacher_id WHERE bg.student_id=? ORDER BY bg.id DESC LIMIT 1',(sid,)); att=q(c,'SELECT a.*,s.name subject FROM attendance a LEFT JOIN subjects s ON s.id=a.subject_id WHERE a.student_id=? ORDER BY a.date DESC',(sid,)); notes=q(c,'SELECT n.*,u.full_name teacher FROM notes n JOIN users u ON u.id=n.teacher_id WHERE n.student_id=? ORDER BY n.id DESC',(sid,)); can_manage=can_manage_student(c,u,sid);
     avgall=avg(c,sid); total=len(att); present=sum(1 for x in att if x['status']=='present'); late=sum(1 for x in att if x['status'] in ('late','late_excused')); rate=round((present+late)/total*100) if total else 0
     delete=f"<form method=post action='/student/{sid}/delete' onsubmit=\"return confirm('Usunąć ucznia i powiązane dane?')\"><button class='btn red'>Usuń ucznia</button></form>" if u['role']=='admin' else ''
     manage_forms=(f"<div class='card col12'><h3>Zarządzanie uczniem</h3><div class=row><a class='btn' href='/grades?student_id={sid}'>Dodaj ocenę</a><a class='btn gray' href='/attendance?student_id={sid}'>Dodaj frekwencję</a></div></div>" if can_manage else '')
     password_manage=(f"<div class='card col12'><h3>Hasło użytkownika</h3><p class=muted>Ze względów bezpieczeństwa administrator nie może odczytać starego hasła. Może natomiast ustawić nowe hasło dla tego konta.</p><form class=form method=post action='/student/{sid}/password'><input type=password name=new_password placeholder='Nowe hasło' minlength=4 required><input type=password name=confirm_password placeholder='Powtórz nowe hasło' minlength=4 required><button class='btn amber'>Ustaw nowe hasło</button></form></div>" if u['role']=='admin' else '')
     notes_html=''.join(f"<div class='note-row {'note-positive' if n['positive'] else 'note-negative'}'><div class='note-title'>{'Pochwała' if n['positive'] else 'Uwaga'} · {esc(n['teacher'])}</div><div class='note-text'>{esc(n['text'])}</div><div class='muted' style='margin-top:6px'>{esc(n['date'] or n['created_at'])}</div>{(f"<div style='margin-top:10px'><a class='btn sm gray' href='/note/{n['id']}/edit'>Edytuj</a> <form method=post action='/note/{n['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć wpis?')\"><button class='btn sm red'>Usuń</button></form></div>" if (u['role']=='admin' or n['teacher_id']==u['id']) else '')}</div>" for n in notes) or '<div class=empty>Brak pochwał i uwag.</div>'
     note_form=(f"<div class='card col12'><h3>Dodaj pochwałę lub uwagę</h3><form class=form method=post action=/note><input type=hidden name=student_id value='{sid}'><textarea name=text placeholder='Treść wpisu' required></textarea><select name=positive><option value=1>Pochwała</option><option value=0>Uwaga</option></select><button class=btn>Dodaj wpis</button></form></div>" if can_manage else '')
-    return layout('Profil ucznia',f"<div class=hero><div><h1>{esc(st['full_name'])}</h1><div class=muted>Klasa {esc(st['class_name'])} · średnia {avgall or '—'} · frekwencja {rate}%</div></div>{delete}</div><div class=grid>{manage_forms}{password_manage}<div class='card col8'><h3>Oceny</h3>{grade_subject_board(grades,can_manage)}</div><div class='card col4'><h3>Frekwencja</h3><p class=stat>{rate}%</p><p>Obecności: {present} · wszystkie wpisy: {total}</p><h3>Kontakt</h3><p>{esc(st['email'])}</p></div><div class='card col12'><h3>Historia frekwencji</h3>{attendance_table(att,can_manage)}</div><div class='card col12'><h3>Pochwały i uwagi</h3>{notes_html}</div>{note_form}</div>",u,'/classes')
+    return layout('Profil ucznia',f"<div class=hero><div><h1>{esc(st['full_name'])}</h1><div class=muted>Klasa {esc(st['class_name'])} · średnia {avgall or '—'} · frekwencja {rate}%</div></div>{delete}</div><div class=grid>{manage_forms}{password_manage}<div class='card col8'><h3>Oceny</h3>{grade_subject_board(grades,can_manage)}</div><div class='card col4 behavior-card'><h3>Zachowanie</h3>{('<div class=behavior-value>'+esc(behavior['value'])+'</div><p>'+esc(behavior['comment'])+'</p><small class=muted>'+esc(behavior['teacher'])+' · '+esc(behavior['date'])+'</small>') if behavior else '<p class=muted>Brak oceny z zachowania.</p>'}{(f"<p><a class='btn green' href='/student/{sid}/behavior'>Dodaj ocenę z zachowania</a></p>" if can_manage else '')}</div><div class='card col4'><h3>Frekwencja</h3><p class=stat>{rate}%</p><p>Obecności: {present} · wszystkie wpisy: {total}</p><h3>Kontakt</h3><p>{esc(st['email'])}</p></div><div class='card col12'><h3>Historia frekwencji</h3>{attendance_table(att,can_manage)}</div><div class='card col12'><h3>Pochwały i uwagi</h3>{notes_html}</div>{note_form}</div>",u,'/classes')
+
+def behavior_page(u,c,sid):
+    st=one(c,'SELECT st.id,st.user_id,u.full_name,cl.name class_name,u.school_id FROM students st JOIN users u ON u.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE st.id=?',(sid,))
+    if not st or st['school_id']!=u['school_id'] or (u['role']=='student' and st['user_id']!=u['id']) or (u['role']=='teacher' and not can_manage_student(c,u,sid)):
+        return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u)
+    if u['role']=='student': return layout('403','<div class=card><h1>403</h1><p>Uczeń nie może wystawiać oceny z zachowania.</p></div>',u)
+    vals=['Wzorowe','Bardzo dobre','Dobre','Poprawne','Nieodpowiednie','Naganne']
+    history=q(c,'SELECT bg.*,u.full_name teacher FROM behavior_grades bg JOIN users u ON u.id=bg.teacher_id WHERE bg.student_id=? ORDER BY bg.id DESC',(sid,))
+    rows=''.join(f"<tr><td><b>{esc(x['value'])}</b></td><td>{esc(x['date'])}</td><td>{esc(x['teacher'])}</td><td>{esc(x['comment'])}</td><td><form method=post action='/behavior/{x['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć ocenę z zachowania?')\"><button class='btn sm red'>Usuń</button></form></td></tr>" for x in history) or '<tr><td colspan=5>Brak historii.</td></tr>'
+    body=f"<div class=hero><div><h1>Ocena z zachowania</h1><div class=muted>{esc(st['full_name'])} · klasa {esc(st['class_name'] or '—')}</div></div></div><div class=grid><div class='card col5'><h3>Dodaj ocenę</h3><form class=form method=post action='/student/{sid}/behavior'><select name=value required>{''.join(f'<option>{esc(v)}</option>' for v in vals)}</select><input name=date type=date value='{date.today().isoformat()}' required><textarea name=comment placeholder='Komentarz'></textarea><button class=btn>Dodaj ocenę z zachowania</button></form></div><div class='card col7'><h3>Historia</h3><table class=table><tr><th>Ocena</th><th>Data</th><th>Wystawił</th><th>Komentarz</th><th></th></tr>{rows}</table></div></div>"
+    return layout('Zachowanie',body,u,'/grades')
 
 def attendance_table(rows, can_edit=False):
     lab={'present':'Obecny','absent':'Nieobecny','late':'Spóźnienie','excused':'Usprawiedliwiona nieobecność','late_excused':'Spóźnienie usprawiedliwione','excused_present':'Nieobecność usprawiedliwiona'}
@@ -199,12 +231,15 @@ def attendance_table(rows, can_edit=False):
 
 def grades_page(u,c):
     if u['role']=='student':
-        sid=student_id(c,u); rows=q(c,'SELECT g.*,s.name subject FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY s.name,g.id DESC',(sid,)); subjects=q(c,'SELECT s.id,s.name FROM subjects s JOIN enrollments e ON e.subject_id=s.id WHERE e.student_id=?',(sid,)); form=''
+        sid=student_id(c,u); rows=q(c,"SELECT g.*,s.name subject,(SELECT value FROM behavior_grades bg WHERE bg.student_id=g.student_id ORDER BY bg.id DESC LIMIT 1) behavior FROM grades g JOIN subjects s ON s.id=g.subject_id WHERE g.student_id=? ORDER BY s.name,g.id DESC",(sid,)); subjects=q(c,'SELECT s.id,s.name FROM subjects s JOIN enrollments e ON e.subject_id=s.id WHERE e.student_id=?',(sid,)); form=''
     else:
-        rows=q(c,'SELECT g.*,s.name subject,u.full_name student,st.id student_id FROM grades g JOIN subjects s ON s.id=g.subject_id JOIN students st ON st.id=g.student_id JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY g.id DESC',(u['school_id'],)); subjects=q(c,'SELECT * FROM subjects WHERE school_id=?',(u['school_id'],)); students=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY u.full_name',(u['school_id'],))
+        rows=q(c,"SELECT g.*,s.name subject,u.full_name student,st.id student_id,(SELECT value FROM behavior_grades bg WHERE bg.student_id=st.id ORDER BY bg.id DESC LIMIT 1) behavior FROM grades g JOIN subjects s ON s.id=g.subject_id JOIN students st ON st.id=g.student_id JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY g.id DESC",(u['school_id'],)); subjects=q(c,'SELECT * FROM subjects WHERE school_id=?',(u['school_id'],)); students=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE u.school_id=? ORDER BY u.full_name',(u['school_id'],))
         form="<div class='card col12'><h3>Dodaj ocenę</h3><form class=form method=post action=/grade><div class=row><select name=student_id required>"+opts(students,'id','full_name')+"</select><select name=subject_id required>"+opts(subjects,'id','name')+"</select></div><div class=row><input name=value placeholder='Ocena, np. 5' required><input name=weight type=number step=.5 value=1 min=.5></div><div class=row><input name=category value='Ocena'><input name=comment placeholder='Komentarz'></div><button class=btn>Dodaj ocenę</button></form></div>"
     bysub=''
-    if u['role']=='student': bysub="<div class='card' style='margin-bottom:16px'><h3>Oceny według przedmiotów</h3>"+grade_subject_board(rows,False)+"</div>"
+    if u['role']=='student':
+        b=one(c,'SELECT bg.*,u.full_name teacher FROM behavior_grades bg JOIN users u ON u.id=bg.teacher_id WHERE bg.student_id=? ORDER BY bg.id DESC LIMIT 1',(sid,))
+        behavior_box=f"<div class='card behavior-card' style='margin-bottom:16px'><h3>Zachowanie</h3><div class=behavior-value>{esc(b['value'])}</div><p>{esc(b['comment'])}</p><small class=muted>{esc(b['teacher'])} · {esc(b['date'])}</small></div>" if b else "<div class='card behavior-card' style='margin-bottom:16px'><h3>Zachowanie</h3><p class=muted>Brak oceny z zachowania.</p></div>"
+        bysub=behavior_box+"<div class='card' style='margin-bottom:16px'><h3>Oceny według przedmiotów</h3>"+grade_subject_board(rows,False)+"</div>"
     all_html=("<div class=card><h3>Wszystkie oceny</h3>"+grade_table(rows, u['role']=='admin')+"</div>") if u['role']!='student' else ''
     return layout('Oceny i średnie',"<div class=hero><div><h1>Oceny i średnie</h1><div class=muted>Średnie ważone i szczegółowa lista ocen.</div></div></div>"+form+bysub+all_html,u,'/grades')
 
@@ -244,8 +279,8 @@ def lesson_card(x,u,c):
     cls=esc(x['class_name']); teacher=esc(x['teacher']); day=occurrence_date(x['weekday'])
     status=None
     if u['role']=='student': status=lesson_status_for_student(c,x['id'],student_id(c,u),day)
-    color={'present':'lesson-present','absent':'lesson-absent','late':'lesson-late','excused':'lesson-excused','late_excused':'lesson-late-excused','excused_present':'lesson-excused-present'}.get(status,'')
     topic=lesson_topic(c,x['id'],day)
+    color=({'present':'lesson-present','absent':'lesson-absent','late':'lesson-late','excused':'lesson-excused','late_excused':'lesson-late-excused','excused_present':'lesson-excused-present'}.get(status,'')) if u['role']=='student' else ('lesson-topic-set' if topic else 'lesson-topic-missing')
     meta=(f"<span>{esc(topic)}</span>" if topic else '<span>Brak tematu</span>')
     return f"<a class='lesson {color}' href='/lesson/{x['id']}?date={day.isoformat()}'><b>{esc(x['subject'])}</b><br>{cls if u['role']!='student' else teacher}<br>s. {esc(x['room'])}<small>{meta}</small></a>"
 
@@ -259,6 +294,7 @@ def schedule_page(u,c):
         cells+=f"<div class=head>{esc(t)}</div>"+''.join(next((lesson_card(x,u,c) for x in lessons if x['weekday']==i and x['start_time']==t),'<div></div>') for i in range(1,6))
     legend=''
     if u['role']=='student': legend="<div class='pillrow' style='margin-top:14px'><span class='badge present-b'>Obecność</span><span class='badge absent-b'>Nieobecność</span><span class='badge late-b'>Spóźnienie</span><span class='badge'>Kliknij lekcję, aby zobaczyć temat</span></div>"
+    elif u['role'] in ('teacher','admin'): legend="<div class='pillrow' style='margin-top:14px'><span class='badge late-b'>Żółty — brak tematu</span><span class='badge present-b'>Zielony — temat wpisany</span></div>"
     return layout('Plan tygodniowy',f"<div class=hero><div><h1>Plan tygodniowy</h1><div class=muted>Przedmiot jest klikalny — nauczyciel otwiera kartę lekcji, a uczeń widzi temat i swoją frekwencję.</div></div><a class=btn href='/lessons'>Zarządzaj planem</a></div><div class=schedule>{cells or '<div class=empty style=grid-column:1/-1>Brak lekcji.</div>'}</div>{legend}",u,'/schedule')
 
 def lesson_detail(u,c,lid):
@@ -332,6 +368,32 @@ def admins_page(u,c):
     body=f"<div class='hero'><div><h1>Administratorzy</h1><div class='muted'>Dodawaj i usuwaj konta administratorów szkoły.</div></div></div><div class='grid'><div class='card col7'><h3>Lista administratorów</h3><table class='table'><thead><tr><th>Osoba</th><th>Login</th><th>E-mail</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div><div class='card col5'><h3>Dodaj administratora</h3><form class='form' method='post' action='/admin'><input name='full_name' placeholder='Imię i nazwisko' required><input name='username' placeholder='Login' required><input name='password' placeholder='Hasło' value='admin123' required><input name='email' placeholder='E-mail'><button class='btn'>Dodaj administratora</button></form></div></div>"
     return layout('Administratorzy',body,u,'/admins')
 
+def users_page(u,c):
+    if u['role']!='admin':
+        return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u,'/users')
+    teachers=q(c,"SELECT id,username,full_name,email,phone,info,active FROM users WHERE role='teacher' AND school_id=? ORDER BY full_name",(u['school_id'],))
+    students=q(c,"SELECT st.id,st.class_id,u.id user_id,u.username,u.full_name,u.email,u.info,cl.name class_name FROM students st JOIN users u ON u.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE u.school_id=? ORDER BY cl.name,u.full_name",(u['school_id'],))
+    classes=q(c,'SELECT id,name,teacher_id FROM classes WHERE school_id=? ORDER BY name',(u['school_id'],))
+    teacher_rows=[]
+    for x in teachers:
+        teacher_classes=q(c,'SELECT id,name FROM classes WHERE school_id=? AND teacher_id=? ORDER BY name',(u['school_id'],x['id']))
+        selected_class=teacher_classes[0]['id'] if len(teacher_classes)==1 else None
+        class_form="<form class=form method=post action='/teacher/%s/class'><select name=class_id><option value=''>Bez klasy wychowawczej</option>%s</select><button class='btn sm gray'>Przypisz</button></form>"%(x['id'],opts(classes,'id','name',selected_class))
+        assigned=', '.join(esc(z['name']) for z in teacher_classes) or 'Brak'
+        teacher_rows.append("<tr><td><b>%s</b><br><small>%s</small></td><td>%s</td><td><div class=user-info><b>Klasy wychowawcze:</b> %s</div>%s</td><td><div class=user-info>%s</div><form class=form method=post action='/user/%s/info'><input name=info value='%s' placeholder='Informacja o nauczycielu'><button class='btn sm gray'>Zapisz</button></form></td><td><form method=post action='/teacher/%s/delete' onsubmit='return confirm(\"Usunąć nauczyciela? Zostaną usunięte jego lekcje, oceny, uwagi i wpisy zachowania.\")'><button class='btn sm red'>Usuń nauczyciela</button></form></td></tr>"%(esc(x['full_name']),esc(x['username']),esc(x['email'] or '—'),assigned,class_form,esc(x['info'] or 'Brak informacji'),x['id'],esc(x['info']),x['id']))
+    student_rows=[]
+    for x in students:
+        student_rows.append("<tr><td><b>%s</b><br><small>%s</small></td><td><form class=form method=post action='/student/%s/class'><select name=class_id><option value=''>Bez klasy</option>%s</select><button class='btn sm gray'>Przypisz klasę</button></form></td><td><div class=user-info>%s</div><form class=form method=post action='/user/%s/info'><input name=info value='%s' placeholder='Informacja o uczniu'><button class='btn sm gray'>Zapisz</button></form></td><td><a class='btn sm' href='/student/%s'>Profil</a></td><td><form method=post action='/student/%s/delete' onsubmit='return confirm(\"Usunąć ucznia i wszystkie jego dane?\")'><button class='btn sm red'>Usuń ucznia</button></form></td></tr>"%(esc(x['full_name']),esc(x['username']),x['id'],opts(classes,'id','name',x['class_id']),esc(x['info'] or 'Brak informacji'),x['user_id'],esc(x['info']),x['id'],x['id']))
+    add="<div class='card col5'><h3>Dodaj nauczyciela</h3><form class=form method=post action=/teacher><input name=full_name placeholder='Imię i nazwisko' required><input name=username placeholder='Login' required><input name=password placeholder='Hasło' minlength=4 required><input name=email placeholder='E-mail'><input name=phone placeholder='Telefon'><textarea name=info placeholder='Informacja o nauczycielu'></textarea><button class=btn>Dodaj nauczyciela</button></form></div>"
+    body="<div class=hero><div><h1>Zarządzanie użytkownikami</h1><div class=muted>Osobny panel administratora do dodawania, przypisywania i usuwania nauczycieli oraz uczniów.</div></div></div><div class=grid>%s<div class='card col7'><h3>Nauczyciele — przypisywanie klas i usuwanie</h3><table class=table><tr><th>Nauczyciel</th><th>E-mail</th><th>Klasa wychowawcza</th><th>Informacja</th><th>Akcja</th></tr>%s</table></div><div class='card col12'><h3>Uczniowie — przypisywanie klas i usuwanie</h3><table class=table><tr><th>Uczeń</th><th>Klasa</th><th>Informacja</th><th>Profil</th><th>Akcja</th></tr>%s</table></div></div>"%(add,''.join(teacher_rows) or '<tr><td colspan=5>Brak nauczycieli.</td></tr>',''.join(student_rows) or '<tr><td colspan=5>Brak uczniów.</td></tr>')
+    return layout('Użytkownicy',body,u,'/users')
+
+def school_page(u,c):
+    if u['role']!='admin': return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u,'/school')
+    school=one(c,'SELECT * FROM schools WHERE id=?',(u['school_id'],))
+    body=f"<div class=hero><div><h1>Zarządzanie szkołą</h1><div class=muted>Edytuj dane swojej szkoły lub utwórz nową szkołę z kontem administratora.</div></div></div><div class=grid><div class='card col6'><h3>Dane szkoły</h3><form class=form method=post action=/school><input name=name value='{esc(school['name'])}' placeholder='Nazwa szkoły' required><input name=address value='{esc(school['address'])}' placeholder='Adres'><input name=email value='{esc(school['email'])}' placeholder='E-mail'><button class=btn>Zapisz dane szkoły</button></form></div><div class='card col6'><h3>Utwórz nową szkołę</h3><form class=form method=post action=/school/create><input name=school_name placeholder='Nazwa nowej szkoły' required><input name=school_address placeholder='Adres'><input name=school_email placeholder='E-mail szkoły'><input name=admin_name placeholder='Imię i nazwisko administratora' required><input name=admin_username placeholder='Login administratora' required><input name=admin_password placeholder='Hasło administratora' minlength=4 required><button class='btn green'>Utwórz szkołę</button></form></div></div>"
+    return layout('Szkoła',body,u,'/school')
+
 def announcements_page(u,c):
     rows=q(c,'SELECT * FROM announcements WHERE school_id=? ORDER BY id DESC',(u['school_id'],)); form=f"<div class='card col12'><h3>Dodaj komunikat</h3><form class=form method=post action=/announcement><input name=title placeholder='Tytuł' required><textarea name=body placeholder='Treść' required></textarea><select name=target><option>Wszyscy</option><option>Uczniowie</option><option>Nauczyciele</option></select><button class=btn>Opublikuj</button></form></div>" if u['role'] in ('admin','teacher') else ''
     cards=''.join(f"<div class=card><span class=badge>{esc(x['target'])}</span><h3>{esc(x['title'])}</h3><p>{esc(x['body'])}</p><small class=muted>{esc(x['created_at'])}</small></div>" for x in rows)
@@ -362,7 +424,7 @@ def subjects_page(u,c):
     return layout('Przedmioty',body,u,'/subjects')
 
 def profile(u,c):
-    return layout('Profil',f"<div class=hero><div><h1>Profil</h1><div class=muted>Dane konta i bezpieczeństwo.</div></div></div><div class='grid'><div class='card col6'><h3>Dane konta</h3><p><b>Imię i nazwisko:</b> {esc(u['full_name'])}</p><p><b>Login:</b> {esc(u['username'])}</p><p><b>Rola:</b> {esc(u['role'])}</p><p><b>E-mail:</b> {esc(u['email'])}</p></div><div class='card col6'><h3>Zmiana hasła</h3><form class=form method=post action=/profile/password><input type=password name=current_password placeholder='Obecne hasło' required><input type=password name=new_password placeholder='Nowe hasło' minlength=4 required><input type=password name=confirm_password placeholder='Powtórz nowe hasło' minlength=4 required><button class=btn>Zmień hasło</button></form></div></div>",u,'')
+    return layout('Profil',f"<div class=hero><div><h1>Profil</h1><div class=muted>Dane konta i bezpieczeństwo.</div></div></div><div class='grid'><div class='card col6'><h3>Dane konta</h3><p><b>Imię i nazwisko:</b> {esc(u['full_name'])}</p><p><b>Login:</b> {esc(u['username'])}</p><p><b>Rola:</b> {esc(u['role'])}</p><p><b>E-mail:</b> {esc(u['email'])}</p><p><b>Informacja:</b> {esc(u['info'] or '—')}</p></div><div class='card col6'><h3>Zmiana hasła</h3><form class=form method=post action=/profile/password><input type=password name=current_password placeholder='Obecne hasło' required><input type=password name=new_password placeholder='Nowe hasło' minlength=4 required><input type=password name=confirm_password placeholder='Powtórz nowe hasło' minlength=4 required><button class=btn>Zmień hasło</button></form></div></div>",u,'')
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
@@ -370,9 +432,28 @@ class Handler(BaseHTTPRequestHandler):
         b=body.encode(); self.send_response(status); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
     def redirect(self,path): self.send_response(303); self.send_header('Location',path); self.end_headers()
     def user(self):
-        ck=cookies.SimpleCookie(self.headers.get('Cookie','')); sid=ck.get('sid'); return SESSIONS.get(sid.value) if sid else None
+        ck=cookies.SimpleCookie(self.headers.get('Cookie','')); sid=ck.get('sid');
+        if not sid: return None
+        sess=SESSIONS.get(sid.value)
+        if not sess: return None
+        if sess.get('expires',0)<time.time(): SESSIONS.pop(sid.value,None); return None
+        sess['expires']=time.time()+SESSION_TTL
+        return sess['user']
     def form(self):
         n=int(self.headers.get('Content-Length','0')); raw=self.rfile.read(n).decode(); return {k:v[0] for k,v in parse_qs(raw).items()}
+    def csrf_token(self):
+        ck=cookies.SimpleCookie(self.headers.get('Cookie','')); sid=ck.get('sid')
+        if not sid or sid.value not in SESSIONS: return ''
+        sess=SESSIONS[sid.value]; token=sess.get('csrf')
+        if not token:
+            token=secrets.token_urlsafe(24); sess['csrf']=token
+        return token
+    def secure_forms(self, body):
+        token=self.csrf_token()
+        if not token: return body
+        hidden=f"<input type='hidden' name='csrf' value='{token}'>"
+        return re.sub(r"<form([^>]*\bmethod=['\"]?post['\"]?[^>]*)>", lambda m:m.group(0)+hidden, body, flags=re.I)
+
     def do_GET(self):
         path=urlparse(self.path).path; u=self.user()
         if path in ('/','/login'): return self.send(body=login_page())
@@ -394,6 +475,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/grades': out=grades_page(u,c)
             elif path=='/announcements': out=announcements_page(u,c)
             elif path=='/admins': out=admins_page(u,c)
+            elif path=='/users': out=users_page(u,c)
+            elif path=='/school': out=school_page(u,c)
             elif path=='/subjects': out=subjects_page(u,c)
             elif path=='/my-notes': out=my_notes_page(u,c)
             elif path=='/messages': out=messages_page(u,c)
@@ -401,6 +484,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith('/grade/') and path.endswith('/edit'): out=edit_grade(u,c,int(path.split('/')[2]))
             elif path.startswith('/attendance/') and path.endswith('/edit'): out=edit_attendance(u,c,int(path.split('/')[2]))
             elif path.startswith('/note/') and path.endswith('/edit'): out=edit_note(u,c,int(path.split('/')[2]))
+            elif path.startswith('/student/') and path.endswith('/behavior'): out=behavior_page(u,c,int(path.split('/')[2]))
             elif path.startswith('/student/'): out=student_page(u,c,int(path.split('/')[2]))
             elif path.startswith('/lesson/') and path.endswith('/edit'): out=edit_lesson(u,c,int(path.split('/')[2]))
             elif path.startswith('/lesson/') and path.count('/')==2: 
@@ -412,16 +496,21 @@ class Handler(BaseHTTPRequestHandler):
                     except: day=occurrence_date(l['weekday'])
                     out=lesson_detail_for_date(u,c,l,day)
             else: out=layout('404','<div class=card><h1>404</h1><p>Nie znaleziono strony.</p></div>',u)
-            self.send(body=out)
+            self.send(body=self.secure_forms(out))
         finally: c.close()
     def do_POST(self):
         path=urlparse(self.path).path; data=self.form(); u=self.user()
         if path=='/login':
-            c=connect(); username=data.get('username','').strip(); password=data.get('password',''); selected_role=data.get('role','auto'); row=one(c,'SELECT * FROM users WHERE username=? AND password_hash=? AND active=1',(username,hpw(password)));
-            if row and selected_role not in ('','auto') and row['role'] != selected_role: row=None; c.close()
-            if not row: return self.send(body=login_page('Nieprawidłowe dane logowania.'))
-            sid=secrets.token_urlsafe(24); SESSIONS[sid]=dict(row); self.send_response(303); self.send_header('Location','/dashboard'); self.send_header('Set-Cookie',f'sid={sid}; HttpOnly; SameSite=Lax'); self.end_headers(); return
+            c=connect(); username=data.get('username','').strip(); password=data.get('password',''); selected_role=data.get('role','auto'); row=one(c,'SELECT * FROM users WHERE username=? AND active=1',(username,))
+            if not row or not verify_password(row['password_hash'],password): c.close(); return self.send(body=login_page('Nieprawidłowe dane logowania.'))
+            if selected_role not in ('','auto') and row['role'] != selected_role: c.close(); return self.send(body=login_page('Wybrana rola nie pasuje do konta.'))
+            if not row['password_hash'].startswith('pbkdf2$'):
+                c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(password),row['id'])); c.commit(); row=one(c,'SELECT * FROM users WHERE id=?',(row['id'],))
+            sid=secrets.token_urlsafe(32); SESSIONS[sid]={'user':dict(row),'expires':time.time()+SESSION_TTL,'csrf':secrets.token_urlsafe(24)}
+            self.send_response(303); self.send_header('Location','/dashboard'); secure='; Secure' if self.headers.get('X-Forwarded-Proto','').lower()=='https' else ''; self.send_header('Set-Cookie',f'sid={sid}; HttpOnly; SameSite=Lax{secure}; Max-Age={SESSION_TTL}'); self.end_headers(); return
         if not u: return self.redirect('/login')
+        ck=cookies.SimpleCookie(self.headers.get('Cookie','')); sid_cookie=ck.get('sid'); sess=SESSIONS.get(sid_cookie.value) if sid_cookie else None
+        if CSRF_ENABLED and (not sess or not hmac.compare_digest(data.get('csrf',''), sess.get('csrf',''))): return self.send(403,login_page('Sesja wygasła lub formularz jest nieprawidłowy. Zaloguj się ponownie.'))
         c=connect()
         try:
             note_redirect_student=None
@@ -432,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
                 if data.get('new_password')!=data.get('confirm_password'): raise ValueError('Nowe hasła nie są takie same.')
                 if len(data.get('new_password',''))<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
                 row=one(c,'SELECT password_hash FROM users WHERE id=?',(u['id'],))
-                if not row or row['password_hash']!=hpw(data.get('current_password','')): raise ValueError('Obecne hasło jest nieprawidłowe.')
+                if not row or not verify_password(row['password_hash'],data.get('current_password','')): raise ValueError('Obecne hasło jest nieprawidłowe.')
                 c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(data['new_password']),u['id']))
             elif path.startswith('/student/') and path.endswith('/password') and u['role']=='admin':
                 sid=int(path.split('/')[2]); st=one(c,'SELECT user_id FROM students st JOIN users us ON us.id=st.user_id WHERE st.id=? AND us.school_id=?',(sid,u['school_id']))
@@ -440,6 +529,50 @@ class Handler(BaseHTTPRequestHandler):
                 if data.get('new_password')!=data.get('confirm_password'): raise ValueError('Nowe hasła nie są takie same.')
                 if len(data.get('new_password',''))<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
                 c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(data['new_password']),st['user_id']))
+            elif path=='/teacher' and u['role']=='admin':
+                username=data['username'].strip(); password=data.get('password',''); full_name=data['full_name'].strip()
+                if len(password)<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
+                c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email,phone,info) VALUES(?,?,?,?,?,?,?,?)',(username,hpw(password),'teacher',u['school_id'],full_name,data.get('email',''),data.get('phone',''),data.get('info','')))
+            elif path.startswith('/teacher/') and path.endswith('/class') and u['role']=='admin':
+                tid=int(path.split('/')[2]); t=one(c,"SELECT id FROM users WHERE id=? AND role='teacher' AND school_id=?",(tid,u['school_id']))
+                if not t: raise ValueError('Nie znaleziono nauczyciela.')
+                cid=data.get('class_id') or None
+                if cid and not one(c,'SELECT id FROM classes WHERE id=? AND school_id=?',(cid,u['school_id'])): raise ValueError('Nie znaleziono klasy.')
+                c.execute('UPDATE classes SET teacher_id=NULL WHERE teacher_id=?',(tid,))
+                if cid: c.execute('UPDATE classes SET teacher_id=? WHERE id=? AND school_id=?',(tid,cid,u['school_id']))
+            elif path.startswith('/teacher/') and path.endswith('/delete') and u['role']=='admin':
+                tid=int(path.split('/')[2]); t=one(c,"SELECT id FROM users WHERE id=? AND role='teacher' AND school_id=?",(tid,u['school_id']))
+                if not t: raise ValueError('Nie znaleziono nauczyciela.')
+                c.execute('UPDATE classes SET teacher_id=NULL WHERE teacher_id=?',(tid,)); c.execute('DELETE FROM lessons WHERE teacher_id=?',(tid,)); c.execute('DELETE FROM notes WHERE teacher_id=?',(tid,)); c.execute('DELETE FROM grades WHERE teacher_id=?',(tid,)); c.execute('DELETE FROM behavior_grades WHERE teacher_id=?',(tid,)); c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(tid,tid)); c.execute('DELETE FROM users WHERE id=?',(tid,))
+            elif path.startswith('/user/') and path.endswith('/info') and u['role']=='admin':
+                uid=int(path.split('/')[2]); ok=one(c,'SELECT id FROM users WHERE id=? AND school_id=?',(uid,u['school_id']))
+                if not ok: raise ValueError('Nie znaleziono użytkownika.')
+                c.execute('UPDATE users SET info=? WHERE id=?',(data.get('info','').strip(),uid))
+            elif path.startswith('/student/') and path.endswith('/class') and u['role']=='admin':
+                sid=int(path.split('/')[2]); st=one(c,'SELECT st.id FROM students st JOIN users us ON us.id=st.user_id WHERE st.id=? AND us.school_id=?',(sid,u['school_id']))
+                if not st: raise ValueError('Nie znaleziono ucznia.')
+                cid=data.get('class_id') or None
+                if cid and not one(c,'SELECT id FROM classes WHERE id=? AND school_id=?',(cid,u['school_id'])): raise ValueError('Nie znaleziono klasy.')
+                c.execute('UPDATE students SET class_id=? WHERE id=?',(cid,sid))
+            elif path=='/school' and u['role']=='admin':
+                if not data.get('name','').strip(): raise ValueError('Nazwa szkoły jest wymagana.')
+                c.execute('UPDATE schools SET name=?,address=?,email=? WHERE id=?',(data['name'].strip(),data.get('address','').strip(),data.get('email','').strip(),u['school_id']))
+            elif path=='/school/create' and u['role']=='admin':
+                sn=data['school_name'].strip(); an=data['admin_name'].strip(); au=data['admin_username'].strip(); ap=data['admin_password']
+                if len(ap)<4: raise ValueError('Hasło administratora musi mieć co najmniej 4 znaki.')
+                c.execute('INSERT INTO schools(name,address,email) VALUES(?,?,?)',(sn,data.get('school_address','').strip(),data.get('school_email','').strip())); nsid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(au,hpw(ap),'admin',nsid,an,data.get('school_email','').strip()))
+            elif path=='/student/' and False:
+                pass
+            elif path.startswith('/student/') and path.endswith('/behavior') and u['role'] in ('admin','teacher'):
+                sid=int(path.split('/')[2])
+                if not can_manage_student(c,u,sid): raise ValueError('Brak uprawnień do tego ucznia.')
+                val=data['value'].strip(); d=data.get('date') or date.today().isoformat()
+                c.execute('INSERT INTO behavior_grades(student_id,teacher_id,value,comment,date) VALUES(?,?,?,?,?)',(sid,u['id'],val,data.get('comment','').strip(),d))
+            elif path.startswith('/behavior/') and path.endswith('/delete') and u['role'] in ('admin','teacher'):
+                bid=int(path.split('/')[2]); b=one(c,'SELECT student_id,teacher_id FROM behavior_grades WHERE id=?',(bid,))
+                if not b or (u['role']!='admin' and b['teacher_id']!=u['id']): raise ValueError('Możesz usuwać tylko własne wpisy. Administrator może usuwać każdy wpis.')
+                c.execute('DELETE FROM behavior_grades WHERE id=?',(bid,))
             elif path=='/subject' and u['role']=='admin':
                 name=data.get('name','').strip(); short=data.get('short_name','').strip()
                 if not name: raise ValueError('Nazwa przedmiotu jest wymagana.')
@@ -545,8 +678,9 @@ class Handler(BaseHTTPRequestHandler):
                 lid=int(path.split('/')[2]); c.execute('UPDATE lessons SET class_id=?,subject_id=?,teacher_id=?,weekday=?,start_time=?,end_time=?,room=? WHERE id=?',(data['class_id'],data['subject_id'],data['teacher_id'],int(data['weekday']),data['start_time'],data['end_time'],data.get('room',''),lid))
             elif path.startswith('/lesson/') and path.endswith('/delete') and u['role'] in ('admin','teacher'): c.execute('DELETE FROM lessons WHERE id=?',(int(path.split('/')[2]),))
             elif path.startswith('/student/') and path.endswith('/delete') and u['role']=='admin':
-                sid=int(path.split('/')[2]); st=one(c,'SELECT user_id FROM students WHERE id=?',(sid,));
-                if st: c.execute('DELETE FROM students WHERE id=?',(sid,)); c.execute('DELETE FROM users WHERE id=?',(st['user_id'],))
+                sid=int(path.split('/')[2]); st=one(c,'SELECT st.user_id FROM students st JOIN users us ON us.id=st.user_id WHERE st.id=? AND us.school_id=?',(sid,u['school_id']))
+                if not st: raise ValueError('Nie znaleziono ucznia.')
+                c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(st['user_id'],st['user_id'])); c.execute('DELETE FROM students WHERE id=?',(sid,)); c.execute('DELETE FROM users WHERE id=?',(st['user_id'],))
             else: c.close(); return self.send(403,layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u))
             c.commit()
         except (sqlite3.IntegrityError,ValueError,KeyError) as e:
@@ -555,17 +689,18 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith('/note/'):
             target='/student/'+str(note_redirect_student) if note_redirect_student else '/classes'
         elif path=='/note': target='/student/'+str(data.get('student_id'))
-        elif path=='/profile/password': target='/profile'
+        elif path.startswith('/behavior/') or (path.startswith('/student/') and path.endswith('/behavior')): target='/student/'+path.split('/')[2]
         elif path.startswith('/student/') and path.endswith('/password'): target='/student/'+path.split('/')[2]
+        elif path.startswith('/student/') and (path.endswith('/delete') or path.endswith('/class')): target='/users'
         elif path=='/subject' or path.startswith('/subject/'): target='/subjects'
         elif path.startswith('/grade'): target='/grades'
         elif path.startswith('/attendance'): target='/attendance'
         elif path.startswith('/lesson/'): target='/lesson/'+path.split('/')[2]
         elif path.startswith('/lesson'): target='/lessons'
         elif path.startswith('/student/') or path=='/class': target='/classes'
-        elif path=='/user': target='/classes'
+        elif path=='/user' or path.startswith('/user/') or path=='/teacher' or path.startswith('/teacher/') or path.startswith('/school'): target='/users' if path.startswith('/user') or path.startswith('/teacher') else '/school'
         else: target='/dashboard'
         self.redirect(target)
 
 if __name__=='__main__':
-    init(); print(f'Super dziennik 4.0: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+    init(); print(f'Super dziennik 4.3: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
