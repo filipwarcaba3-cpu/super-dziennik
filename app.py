@@ -1,41 +1,69 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Super dziennik 4.6 - public-ready demo, stdlib only."""
+"""Super dziennik 4.6.1 - PostgreSQL-ready, SQLite fallback."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from http import cookies
 import sqlite3, hashlib, secrets, html, os, calendar, hmac, time, re
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+PGIntegrityError = psycopg.IntegrityError if psycopg else type('PGIntegrityError',(Exception,),{})
 from datetime import date, datetime, timedelta
 
 BASE=os.path.dirname(os.path.abspath(__file__))
 DATA_DIR=os.getenv('DATA_DIR') or ('/var/data' if os.path.isdir('/var/data') else os.path.join(BASE,'data'))
 os.makedirs(DATA_DIR, exist_ok=True)
+DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 DB=os.getenv('DATABASE_PATH', os.path.join(DATA_DIR,'edziennik.sqlite3'))
 HOST=os.getenv('HOST','0.0.0.0'); PORT=int(os.getenv('PORT','8000')); SESSION_TTL=8*60*60; CSRF_ENABLED=os.getenv('CSRF_ENABLED','1')=='1'; SESSIONS={}
 
 SCHEMA='''
-PRAGMA foreign_keys=ON;
-CREATE TABLE IF NOT EXISTS schools(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,address TEXT DEFAULT '',email TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,school_id INTEGER,full_name TEXT NOT NULL,email TEXT DEFAULT '',phone TEXT DEFAULT '',info TEXT DEFAULT '',active INTEGER DEFAULT 1,FOREIGN KEY(school_id) REFERENCES schools(id));
-CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,name TEXT NOT NULL,year INTEGER DEFAULT 1,teacher_id INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
-CREATE TABLE IF NOT EXISTS students(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,class_id INTEGER,guardian_name TEXT DEFAULT '',guardian_email TEXT DEFAULT '',guardian_phone TEXT DEFAULT '',FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(class_id) REFERENCES classes(id));
-CREATE TABLE IF NOT EXISTS subjects(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,name TEXT NOT NULL,short_name TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
-CREATE TABLE IF NOT EXISTS enrollments(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,UNIQUE(student_id,subject_id),FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
-CREATE TABLE IF NOT EXISTS grades(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,weight REAL DEFAULT 1,category TEXT DEFAULT 'Ocena',comment TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
-CREATE TABLE IF NOT EXISTS behavior_grades(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,comment TEXT DEFAULT '',date TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id));
-CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,date TEXT NOT NULL,status TEXT NOT NULL,subject_id INTEGER,lesson_id INTEGER,comment TEXT DEFAULT '',FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
-CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,text TEXT NOT NULL,positive INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
-CREATE TABLE IF NOT EXISTS excuses(id INTEGER PRIMARY KEY AUTOINCREMENT,student_id INTEGER NOT NULL,date_from TEXT NOT NULL,date_to TEXT NOT NULL,reason TEXT DEFAULT '',status TEXT DEFAULT 'Oczekuje',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,target TEXT DEFAULT 'Wszyscy',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(school_id) REFERENCES schools(id));
-CREATE TABLE IF NOT EXISTS meetings(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,title TEXT NOT NULL,date TEXT NOT NULL,location TEXT DEFAULT '',description TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
-CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY AUTOINCREMENT,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,weekday INTEGER NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,room TEXT DEFAULT '',FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
-CREATE TABLE IF NOT EXISTS lesson_topics(id INTEGER PRIMARY KEY AUTOINCREMENT,lesson_id INTEGER NOT NULL,date TEXT NOT NULL,topic TEXT NOT NULL,UNIQUE(lesson_id,date),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,recipient_id INTEGER NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,read_at TEXT);
-CREATE TABLE IF NOT EXISTS calendar_events(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,title TEXT NOT NULL,date TEXT NOT NULL,time TEXT DEFAULT '',location TEXT DEFAULT '',description TEXT DEFAULT '',created_by INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL);
-CREATE TABLE IF NOT EXISTS tests(id INTEGER PRIMARY KEY AUTOINCREMENT,school_id INTEGER NOT NULL,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,type TEXT NOT NULL,name TEXT NOT NULL,date TEXT NOT NULL,time TEXT DEFAULT '',description TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS schools(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL,address TEXT DEFAULT '',email TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS users(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,school_id INTEGER,full_name TEXT NOT NULL,email TEXT DEFAULT '',phone TEXT DEFAULT '',info TEXT DEFAULT '',active INTEGER DEFAULT 1,FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS classes(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,name TEXT NOT NULL,year INTEGER DEFAULT 1,teacher_id INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS students(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,user_id INTEGER UNIQUE NOT NULL,class_id INTEGER,guardian_name TEXT DEFAULT '',guardian_email TEXT DEFAULT '',guardian_phone TEXT DEFAULT '',FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(class_id) REFERENCES classes(id));
+CREATE TABLE IF NOT EXISTS subjects(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,name TEXT NOT NULL,short_name TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS lessons(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,weekday INTEGER NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,room TEXT DEFAULT '',FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS lesson_topics(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,lesson_id INTEGER NOT NULL,date TEXT NOT NULL,topic TEXT NOT NULL,UNIQUE(lesson_id,date),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS enrollments(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,UNIQUE(student_id,subject_id),FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id));
+CREATE TABLE IF NOT EXISTS grades(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,student_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,weight REAL DEFAULT 1,category TEXT DEFAULT 'Ocena',comment TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS behavior_grades(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,value TEXT NOT NULL,comment TEXT DEFAULT '',date TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS attendance(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,student_id INTEGER NOT NULL,date TEXT NOT NULL,status TEXT NOT NULL,subject_id INTEGER,lesson_id INTEGER,comment TEXT DEFAULT '',FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS notes(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,student_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,text TEXT NOT NULL,positive INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP,lesson_id INTEGER,date TEXT,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,FOREIGN KEY(teacher_id) REFERENCES users(id),FOREIGN KEY(lesson_id) REFERENCES lessons(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS excuses(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,student_id INTEGER NOT NULL,date_from TEXT NOT NULL,date_to TEXT NOT NULL,reason TEXT DEFAULT '',status TEXT DEFAULT 'Oczekuje',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS announcements(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,target TEXT DEFAULT 'Wszyscy',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS meetings(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,title TEXT NOT NULL,date TEXT NOT NULL,location TEXT DEFAULT '',description TEXT DEFAULT '',FOREIGN KEY(school_id) REFERENCES schools(id));
+CREATE TABLE IF NOT EXISTS messages(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,recipient_id INTEGER NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,read_at TEXT);
+CREATE TABLE IF NOT EXISTS calendar_events(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,title TEXT NOT NULL,date TEXT NOT NULL,time TEXT DEFAULT '',location TEXT DEFAULT '',description TEXT DEFAULT '',created_by INTEGER,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL);
+CREATE TABLE IF NOT EXISTS tests(id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,school_id INTEGER NOT NULL,class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,type TEXT NOT NULL,name TEXT NOT NULL,date TEXT NOT NULL,time TEXT DEFAULT '',description TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(school_id) REFERENCES schools(id),FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,FOREIGN KEY(subject_id) REFERENCES subjects(id),FOREIGN KEY(teacher_id) REFERENCES users(id));
 '''
 
+class PGConnection:
+    def __init__(self, raw): self.raw=raw
+    def execute(self, sql, args=()):
+        sql=sql.replace('?', '%s')
+        sql=sql.replace('INSERT OR IGNORE', 'INSERT')
+        if 'ON CONFLICT' not in sql and sql.lstrip().upper().startswith('INSERT') and 'INSERT OR IGNORE' in sql.upper():
+            sql += ' ON CONFLICT DO NOTHING'
+        return self.raw.execute(sql, args)
+    def executescript(self, script):
+        for stmt in script.split(';'):
+            stmt=stmt.strip()
+            if stmt:
+                self.execute(stmt)
+    def commit(self): return self.raw.commit()
+    def rollback(self): return self.raw.rollback()
+    def close(self): return self.raw.close()
+
 def connect():
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError('DATABASE_URL jest ustawione, ale brakuje pakietu psycopg. Dodaj psycopg[binary] do requirements.txt.')
+        return PGConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
     c=sqlite3.connect(DB, timeout=20, check_same_thread=False); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
 
 def hpw_legacy(p): return hashlib.sha256(('edemo:'+p).encode()).hexdigest()
@@ -55,42 +83,51 @@ def verify_password(stored, password):
 
 def one(c,sql,args=()): return c.execute(sql,args).fetchone()
 def q(c,sql,args=()): return c.execute(sql,args).fetchall()
+def insert_id(c,sql,args=()):
+    if DATABASE_URL:
+        row=c.execute(sql+' RETURNING id',args).fetchone()
+        return row['id']
+    c.execute(sql,args)
+    return c.execute('SELECT last_insert_rowid()').fetchone()[0]
 def esc(x): return html.escape(str(x or ''))
 def opts(rows, value_key, label_key, selected=None):
     return ''.join("<option value='%s'%s>%s</option>" % (r[value_key], ' selected' if selected is not None and r[value_key]==selected else '', esc(r[label_key])) for r in rows)
 def now(): return datetime.now().strftime('%Y-%m-%d %H:%M')
 
 def init():
-    c=connect(); c.executescript(SCHEMA)
-    # Migration for existing demo databases: bind attendance to a concrete lesson occurrence.
-    cols=[r['name'] for r in q(c,'PRAGMA table_info(attendance)')]
-    if 'lesson_id' not in cols: c.execute('ALTER TABLE attendance ADD COLUMN lesson_id INTEGER')
-    ucols=[r['name'] for r in q(c,'PRAGMA table_info(users)')]
-    if 'info' not in ucols: c.execute('ALTER TABLE users ADD COLUMN info TEXT DEFAULT ''')
-    gcols=[r['name'] for r in q(c,'PRAGMA table_info(grades)')]
-    if 'lesson_id' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN lesson_id INTEGER')
-    if 'date' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN date TEXT')
-    ncols=[r['name'] for r in q(c,'PRAGMA table_info(notes)')]
-    if 'lesson_id' not in ncols: c.execute('ALTER TABLE notes ADD COLUMN lesson_id INTEGER')
-    if 'date' not in ncols: c.execute('ALTER TABLE notes ADD COLUMN date TEXT')
+    c=connect()
+    schema = SCHEMA if DATABASE_URL else SCHEMA.replace('GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY','PRIMARY KEY AUTOINCREMENT')
+    c.executescript(schema)
+    # Legacy SQLite migrations are needed only when running without DATABASE_URL.
+    if not DATABASE_URL:
+        cols=[r['name'] for r in q(c,'PRAGMA table_info(attendance)')]
+        if 'lesson_id' not in cols: c.execute('ALTER TABLE attendance ADD COLUMN lesson_id INTEGER')
+        ucols=[r['name'] for r in q(c,'PRAGMA table_info(users)')]
+        if 'info' not in ucols: c.execute('ALTER TABLE users ADD COLUMN info TEXT DEFAULT ''')
+        gcols=[r['name'] for r in q(c,'PRAGMA table_info(grades)')]
+        if 'lesson_id' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN lesson_id INTEGER')
+        if 'date' not in gcols: c.execute('ALTER TABLE grades ADD COLUMN date TEXT')
+        ncols=[r['name'] for r in q(c,'PRAGMA table_info(notes)')]
+        if 'lesson_id' not in ncols: c.execute('ALTER TABLE notes ADD COLUMN lesson_id INTEGER')
+        if 'date' not in ncols: c.execute('ALTER TABLE notes ADD COLUMN date TEXT')
     c.commit()
     if one(c,'SELECT COUNT(*) n FROM schools')['n']==0:
-        c.execute("INSERT INTO schools(name,address,email) VALUES(?,?,?)",('Szkoła','ul. Szkolna 1','sekretariat@demo.local')); sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        sid=insert_id(c,"INSERT INTO schools(name,address,email) VALUES(?,?,?)",('Szkoła','ul. Szkolna 1','sekretariat@demo.local'))
         def user(u,p,r,n,email=''):
-            c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(u,hpw(p),r,sid,n,email)); return c.execute('SELECT last_insert_rowid()').fetchone()[0]
+            return insert_id(c,'INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(u,hpw(p),r,sid,n,email))
         admin=user('admin','admin123','admin','Anna Administrator')
         teacher=user('nauczyciel','demo123','teacher','Jan Kowalski','jan@demo.local')
         teacher2=user('nauczyciel2','demo123','teacher','Maria Nowak','maria@demo.local')
         su=user('uczen','demo123','student','Ola Nowak','ola@demo.local'); su2=user('uczen2','demo123','student','Piotr Zielinski')
-        c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(sid,'2A',2,teacher)); ca=c.execute('SELECT last_insert_rowid()').fetchone()[0]
-        c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(sid,'3B',3,teacher2)); cb=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        ca=insert_id(c,'INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(sid,'2A',2,teacher))
+        cb=insert_id(c,'INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(sid,'3B',3,teacher2))
         c.execute('INSERT INTO students(user_id,class_id,guardian_name,guardian_email,guardian_phone) VALUES(?,?,?,?,?)',(su,ca,'Ewa Nowak','ewa@demo.local','500-100-200'))
         c.execute('INSERT INTO students(user_id,class_id,guardian_name,guardian_email,guardian_phone) VALUES(?,?,?,?,?)',(su2,cb,'Tomasz Zielinski','tomasz@demo.local','501-200-300'))
         for n,s in [('Matematyka','MAT'),('Jezyk polski','POL'),('Informatyka','INF'),('Historia','HIS'),('Biologia','BIO')]: c.execute('INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(sid,n,s))
         st1=one(c,'SELECT id FROM students WHERE user_id=?',(su,))['id']; st2=one(c,'SELECT id FROM students WHERE user_id=?',(su2,))['id']
         subs={r['short_name']:r['id'] for r in q(c,'SELECT id,short_name FROM subjects')}
         for st in (st1,st2):
-            for sub in subs.values(): c.execute('INSERT OR IGNORE INTO enrollments(student_id,subject_id) VALUES(?,?)',(st,sub))
+            for sub in subs.values(): c.execute('INSERT INTO enrollments(student_id,subject_id) VALUES(?,?) ON CONFLICT (student_id,subject_id) DO NOTHING',(st,sub))
         for st,sub,val,w,cat in [(st1,subs['MAT'],'5',2,'Sprawdzian'),(st1,subs['POL'],'4+',1,'Aktywnosc'),(st1,subs['INF'],'5-',1,'Projekt'),(st2,subs['MAT'],'3',2,'Kartkowka')]: c.execute('INSERT INTO grades(student_id,subject_id,teacher_id,value,weight,category) VALUES(?,?,?,?,?,?)',(st,sub,teacher,val,w,cat))
         for st,d,s in [(st1,'2026-09-01','present'),(st1,'2026-09-02','late'),(st1,'2026-09-03','absent'),(st1,'2026-09-04','present'),(st2,'2026-09-01','present'),(st2,'2026-09-02','present')]: c.execute('INSERT INTO attendance(student_id,date,status) VALUES(?,?,?)',(st,d,s))
         c.execute('INSERT INTO notes(student_id,teacher_id,text,positive) VALUES(?,?,?,?)',(st1,teacher,'Bardzo dobra praca na lekcji.',1))
@@ -111,7 +148,9 @@ CSS='''
 
 def nav_items(role,path):
     base=[('/dashboard','Pulpit','▦'),('/schedule','Plan tygodniowy','▤'),('/calendar','Kalendarz','◷'),('/attendance','Frekwencja','✓'),('/grades','Oceny' if role=='student' else 'Oceny i średnie','★'),('/announcements','Komunikaty','!'),('/messages','Wiadomości','✉')]
-    if role=='student': base.insert(5,('/my-notes','Uwagi i pochwały','✦'))
+    if role=='student':
+        base.insert(5,('/my-notes','Uwagi i pochwały','✦'))
+        base.insert(6,('/tests','Zapowiedziane sprawdziany','◆'))
     if role in ('admin','teacher'): base.insert(1,('/classes','Klasy','♟'))
     if role=='admin': base += [('/users','Użytkownicy','♙'),('/lessons','Edytor planu','✎'),('/subjects','Przedmioty','A'),('/school','Szkoła','⌂'),('/admins','Administratorzy','⚙'),('/tests','Sprawdziany','◆')]
     elif role=='teacher': base += [('/lessons','Plan lekcji','✎'),('/tests','Sprawdziany','◆')]
@@ -121,9 +160,9 @@ def layout(title,body,u=None,path=''):
     if not u: return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title><style>{CSS}</style></head><body>{body}</body></html>"
     role={'admin':'Administrator','teacher':'Nauczyciel','student':'Uczeń'}[u['role']]
     mobile_nav=nav_items(u['role'],path)
-    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · Super dziennik 4.6</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.5</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
+    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · Super dziennik 4.6.1</title><style>{CSS}</style></head><body><div class='app'><aside class='side'><div class='logo'>Super dziennik <span>4.6.1</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div><nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>Szkoła</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
 def login_page(msg=''):
-    body=f"<!-- legacy compatibility: 4.0 --> <div class='login'><div class='loginbox'><div class='logo'>Super dziennik <span>4.5</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
+    body=f"<!-- legacy compatibility: 4.0 --> <div class='login'><div class='loginbox'><div class='logo'>Super dziennik <span>4.6.1</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
     return layout('Logowanie',body)
 
 def student_id(c,u): return one(c,'SELECT id FROM students WHERE user_id=?',(u['id'],))['id']
@@ -385,9 +424,9 @@ def calendar_page(u,c):
 
 def tests_page(u,c):
     if u['role']=='student':
-        rows=q(c,'SELECT t.*,cl.name class_name,s.name subject FROM tests t JOIN classes cl ON cl.id=t.class_id JOIN subjects s ON s.id=t.subject_id WHERE t.school_id=? AND t.class_id=(SELECT class_id FROM students WHERE user_id=?) ORDER BY t.date,t.time,t.id',(u['school_id'],u['id']))
+        rows=q(c,'SELECT t.*,cl.name class_name,s.name subject FROM tests t JOIN classes cl ON cl.id=t.class_id JOIN subjects s ON s.id=t.subject_id WHERE t.school_id=? AND t.class_id=(SELECT class_id FROM students WHERE user_id=?) AND t.date>=? ORDER BY t.date,t.time,t.id',(u['school_id'],u['id'],date.today().isoformat()))
         html=''.join(f"<div class='card'><span class=badge>{esc(t['type'])}</span><h3>{esc(t['name'])}</h3><p><b>{esc(t['subject'])}</b> · {esc(t['class_name'])}</p><p><b>Data:</b> {esc(t['date'])}{(' · '+esc(t['time'])) if t['time'] else ''}</p>{('<p>'+esc(t['description'])+'</p>') if t['description'] else ''}</div>" for t in rows) or '<div class=empty>Brak zaplanowanych sprawdzianów.</div>'
-        return layout('Sprawdziany',f"<div class=hero><div><h1>Sprawdziany</h1><div class=muted>Zaplanowane formy sprawdzania wiedzy.</div></div></div><div class=grid>{html}</div>",u,'/tests')
+        return layout('Zapowiedziane sprawdziany',f"<div class=hero><div><h1>Zapowiedziane sprawdziany</h1><div class=muted>Sprawdziany, kartkówki, odpowiedzi ustne i egzaminy zaplanowane na dziś lub później.</div></div></div><div class=grid>{html}</div>",u,'/tests')
     classes=q(c,'SELECT id,name FROM classes WHERE school_id=? ORDER BY name',(u['school_id'],)); subjects=q(c,'SELECT id,name FROM subjects WHERE school_id=? ORDER BY name',(u['school_id'],))
     if u['role']=='teacher':
         classes=q(c,'SELECT id,name FROM classes WHERE school_id=? AND (teacher_id=? OR id IN (SELECT class_id FROM lessons WHERE teacher_id=?)) ORDER BY name',(u['school_id'],u['id'],u['id']))
@@ -600,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/school/create' and u['role']=='admin':
                 sn=data['school_name'].strip(); an=data['admin_name'].strip(); au=data['admin_username'].strip(); ap=data['admin_password']
                 if len(ap)<4: raise ValueError('Hasło administratora musi mieć co najmniej 4 znaki.')
-                c.execute('INSERT INTO schools(name,address,email) VALUES(?,?,?)',(sn,data.get('school_address','').strip(),data.get('school_email','').strip())); nsid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                nsid=insert_id(c,'INSERT INTO schools(name,address,email) VALUES(?,?,?)',(sn,data.get('school_address','').strip(),data.get('school_email','').strip()))
                 c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(au,hpw(ap),'admin',nsid,an,data.get('school_email','').strip()))
             elif path=='/student/' and False:
                 pass
@@ -616,10 +655,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/subject' and u['role']=='admin':
                 name=data.get('name','').strip(); short=data.get('short_name','').strip()
                 if not name: raise ValueError('Nazwa przedmiotu jest wymagana.')
-                c.execute('INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(u['school_id'],name,short))
-                new_sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                new_sid=insert_id(c,'INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(u['school_id'],name,short))
                 for st in q(c,'SELECT id FROM students WHERE class_id IN (SELECT id FROM classes WHERE school_id=?)',(u['school_id'],)):
-                    c.execute('INSERT OR IGNORE INTO enrollments(student_id,subject_id) VALUES(?,?)',(st['id'],new_sid))
+                    c.execute('INSERT INTO enrollments(student_id,subject_id) VALUES(?,?) ON CONFLICT (student_id,subject_id) DO NOTHING',(st['id'],new_sid))
             elif path.startswith('/subject/') and path.endswith('/delete') and u['role']=='admin':
                 subid=int(path.split('/')[2]); sub=one(c,'SELECT id FROM subjects WHERE id=? AND school_id=?',(subid,u['school_id']))
                 if not sub: raise ValueError('Nie znaleziono przedmiotu.')
@@ -681,8 +719,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/user' and u['role']=='admin':
                 role=data.get('role','student')
                 if role not in ('student','teacher'): raise ValueError('To miejsce służy do tworzenia uczniów i nauczycieli.')
-                username=data['username']; password=data.get('password','demo123'); c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(username,hpw(password),role,u['school_id'],data['full_name'],data.get('email',''))); uid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
-                if role=='student': c.execute('INSERT INTO students(user_id,class_id) VALUES(?,?)',(uid,data.get('class_id') or None)); stid=c.execute('SELECT last_insert_rowid()').fetchone()[0]; [c.execute('INSERT OR IGNORE INTO enrollments(student_id,subject_id) VALUES(?,?)',(stid,s['id'])) for s in q(c,'SELECT id FROM subjects WHERE school_id=?',(u['school_id'],))]
+                username=data['username']; password=data.get('password','demo123'); uid=insert_id(c,'INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(username,hpw(password),role,u['school_id'],data['full_name'],data.get('email','')))
+                if role=='student': stid=insert_id(c,'INSERT INTO students(user_id,class_id) VALUES(?,?)',(uid,data.get('class_id') or None)); [c.execute('INSERT INTO enrollments(student_id,subject_id) VALUES(?,?) ON CONFLICT (student_id,subject_id) DO NOTHING',(stid,s['id'])) for s in q(c,'SELECT id FROM subjects WHERE school_id=?',(u['school_id'],))]
             elif path=='/admin' and u['role']=='admin':
                 username=data['username'].strip(); password=data.get('password','admin123'); c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(username,hpw(password),'admin',u['school_id'],data['full_name'],data.get('email','')))
             elif path.startswith('/admin/') and path.endswith('/delete') and u['role']=='admin':
@@ -692,8 +730,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not target_admin: raise ValueError('Nie znaleziono administratora.')
                 c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(aid,aid))
                 c.execute('UPDATE classes SET teacher_id=NULL WHERE teacher_id=?',(aid,))
-                c.execute("DELETE FROM users WHERE id=? AND role='admin' AND school_id=?",(aid,u['school_id']))
-                if c.total_changes < 1: raise ValueError('Nie udało się usunąć administratora.')
+                cur=c.execute("DELETE FROM users WHERE id=? AND role='admin' AND school_id=?",(aid,u['school_id']))
+                if getattr(cur,'rowcount',0) < 1: raise ValueError('Nie udało się usunąć administratora.')
             elif path=='/class' and u['role']=='admin': c.execute('INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(u['school_id'],data['name'],int(data.get('year','1')),data.get('teacher_id') or None))
             elif path.startswith('/class/') and path.endswith('/delete') and u['role']=='admin':
                 cid=int(path.split('/')[2]); cls=one(c,'SELECT id FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
@@ -743,7 +781,7 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(st['user_id'],st['user_id'])); c.execute('DELETE FROM students WHERE id=?',(sid,)); c.execute('DELETE FROM users WHERE id=?',(st['user_id'],))
             else: c.close(); return self.send(403,layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u))
             c.commit()
-        except (sqlite3.IntegrityError,ValueError,KeyError) as e:
+        except (sqlite3.IntegrityError,ValueError,KeyError,PGIntegrityError) as e:
             c.rollback(); c.close(); return self.send(body=layout('Błąd',f"<div class=card><h2>Nie udało się zapisać</h2><p>{esc(e)}</p></div>",u))
         c.close()
         if path.startswith('/note/'):
@@ -765,4 +803,4 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(target)
 
 if __name__=='__main__':
-    init(); print(f'Super dziennik 4.6: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+    init(); print(f'Super dziennik 4.6.1: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()

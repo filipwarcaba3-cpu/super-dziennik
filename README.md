@@ -1,30 +1,12 @@
-# Super dziennik 4.2
+# Super dziennik 4.6.1 — Neon PostgreSQL
 
-Demo technologiczne elektronicznego dziennika szkolnego.
+Public-ready demo e-dziennika. Wersja 4.6.1 obsługuje trwałą bazę PostgreSQL (np. Neon) przez zmienną `DATABASE_URL`.
 
-## Nowości 4.2
-- Uczeń ma osobne rubryki **Oceny** oraz **Uwagi i pochwały** w pasku bocznym.
-- Uwagi i pochwały są wyświetlane pionowo, jedna pod drugą.
-- **Uwaga** jest prezentowana na czerwono, a **Pochwała** na zielono.
-- Autor wpisu może edytować i usuwać własną uwagę/pochwałę; administrator może edytować i usuwać każdy wpis.
-- Oceny ucznia są pogrupowane poziomo według przedmiotów w prostokątnych kartach.
-- Im więcej ocen z danego przedmiotu, tym większa szerokość jego prostokąta.
-- Frekwencja zachowuje statusy: obecny, nieobecny, spóźnienie, spóźnienie usprawiedliwione oraz nieobecność usprawiedliwiona.
+## Render
+1. Environment: ustaw `DATABASE_URL` na connection string z Neon.
+2. Build Command: `pip install -r requirements.txt`
+3. Start Command: `python app.py`
 
-## Uruchomienie
-```bash
-python app.py
-```
-Następnie otwórz `http://127.0.0.1:8000`.
+Jeżeli `DATABASE_URL` nie jest ustawione, aplikacja działa lokalnie z SQLite jako trybem awaryjnym.
 
-Demo: `admin/admin123`, `nauczyciel/demo123`, `uczen/demo123`.
-
-## Testy
-```bash
-python test_app.py
-python test_v4.py
-python test_v41.py
-python test_v42.py
-```
-
-To jest prototyp/demo technologiczne, nie system produkcyjny.
+Po uruchomieniu z `DATABASE_URL` aplikacja sama utworzy wymagane tabele PostgreSQL.
