@@ -1,12 +1,15 @@
-# Super dziennik 4.6.1 — Neon PostgreSQL
+# Super dziennik 4.7
 
-Public-ready demo e-dziennika. Wersja 4.6.1 obsługuje trwałą bazę PostgreSQL (np. Neon) przez zmienną `DATABASE_URL`.
+Wersja 4.7 rozwija Super dziennik 4.6.1 PostgreSQL/Neon.
 
-## Render
-1. Environment: ustaw `DATABASE_URL` na connection string z Neon.
-2. Build Command: `pip install -r requirements.txt`
-3. Start Command: `python app.py`
+Najważniejsze zmiany:
+- administrator może edytować klasę: nazwę, rocznik i wychowawcę,
+- administrator może edytować/usuwać każde wydarzenie kalendarza,
+- nauczyciel może edytować/usuwać wydarzenia dodane przez siebie,
+- w kartach przedmiotów w dziale Oceny wyświetlana jest średnia ważona,
+- poprawiono układ mobilny, szerokości kart i tabel,
+- można odwołać konkretną lekcję dla konkretnej daty,
+- odwołana lekcja jest szara, a nazwa przedmiotu przekreślona,
+- nauczyciel/admin może przywrócić odwołaną lekcję.
 
-Jeżeli `DATABASE_URL` nie jest ustawione, aplikacja działa lokalnie z SQLite jako trybem awaryjnym.
-
-Po uruchomieniu z `DATABASE_URL` aplikacja sama utworzy wymagane tabele PostgreSQL.
+Aplikacja zachowuje obsługę `DATABASE_URL` dla PostgreSQL/Neon oraz SQLite jako tryb lokalny.
