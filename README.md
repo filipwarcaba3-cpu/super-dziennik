@@ -1,33 +1,19 @@
-# Super dziennik 4.8 — roczny plan lekcji + Neon PostgreSQL
+# Super dziennik 4.9
 
-Wersja 4.8 zachowuje dane w tej samej bazie Neon i rozszerza plan lekcji o harmonogram na cały rok szkolny.
+Wersja 4.9 rozwija działającą wersję 4.8 z Neon PostgreSQL.
 
-## Nowości 4.8
+## Nowości 4.9
 
-- plan jest wyświetlany dla konkretnego tygodnia,
-- przyciski **Poprzedni tydzień** i **Następny tydzień**,
-- przy nazwach dni tygodnia wyświetlane są konkretne daty `dzień.miesiąc`,
-- w planowaniu zajęć: **Powtarzalność** — co tydzień, co dwa tygodnie lub co miesiąc,
-- pola **Od kiedy** i **Do kiedy** określają okres obowiązywania lekcji,
-- tryb `Co miesiąc` powtarza zajęcia w tym samym porządku dnia tygodnia w miesiącu (np. pierwszy wtorek),
-- dotychczasowe lekcje bez zakresu dat pozostają traktowane jako cotygodniowe,
-- odwołanie lekcji nadal dotyczy jednej konkretnej daty,
-- plan na telefonie można przewijać poziomo, aby zachować czytelne szerokości kolumn.
+- Administrator może dodać, edytować i usunąć informację widoczną na stronie logowania w niebieskim prostokącie.
+- Administrator może edytować i usuwać każdy zaplanowany sprawdzian, a nauczyciel może edytować i usuwać sprawdziany zaplanowane przez siebie.
+- Uczeń widzi w kalendarzu sprawdziany i kartkówki zaplanowane dla jego klasy.
+- W Profilu każdy użytkownik może wybrać kolor dziennika: niebieski (domyślny), zielony lub czerwony. Ustawienie jest zapisywane w bazie.
+- Zachowane są funkcje wersji 4.8, w tym roczny plan lekcji, powtarzalność, daty tygodnia, anulowanie lekcji i Neon PostgreSQL.
 
 ## Render
 
-Environment: `DATABASE_URL` = connection string z Neon.
+- `DATABASE_URL` powinien pozostać ustawiony na connection string z Neon.
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `python app.py`
 
-Build Command:
-
-```bash
-pip install -r requirements.txt
-```
-
-Start Command:
-
-```bash
-python app.py
-```
-
-Przy pierwszym uruchomieniu 4.8 aplikacja bezpiecznie dodaje do tabeli `lessons` kolumny `recurrence`, `date_from` i `date_to`. Nie usuwa istniejących uczniów ani ocen.
+Aktualizacja nie usuwa istniejących uczniów ani ocen. Przy starcie dodawane są tylko brakujące kolumny `schools.login_notice` i `users.theme`.
