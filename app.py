@@ -234,7 +234,7 @@ def layout(title,body,u=None,path=''):
     it_class=' it-panel' if is_it(u) else ''; name=journal_name(); school_switch=''
     if u['role']=='it_admin':
         school_switch=f"<div class='it-school-box'><small>Edytowana szkoła</small><a href='/it/schools'>{esc(row_get(u,'editing_school_name','Wybierz szkołę'))}</a></div>"
-    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · {esc(name)}</title><style>{CSS}</style></head><body class='{theme_class}{it_class}'><div class='app'><aside class='side'><div class='logo'>{esc(name)} <span>4.12</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div>{school_switch}<nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>{'Dział IT' if is_it(u) else 'Szkoła'}</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
+    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · {esc(name)}</title><style>{CSS}</style></head><body class='{theme_class}{it_class}'><div class='app'><aside class='side'><div class='logo'>{esc(name)} <span>4.12.1</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div>{school_switch}<nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>{'Dział IT' if is_it(u) else 'Szkoła'}</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
 
 def login_page(msg=''):
     notices=''
@@ -713,9 +713,26 @@ def it_schools_page(u,c):
     return layout('Szkoły',f"<div class=hero><div><h1>Szkoły</h1><div class=muted>Tylko Administrator IT może dodawać i usuwać szkoły.</div></div></div><div class=grid>{add}{cards or '<div class=empty>Brak szkół.</div>'}</div>",u,'/it/schools')
 
 def it_school_info_page(u,c):
-    if not is_it(u) or not u['school_id']: return layout('403','<div class=card><h1>Brak wybranej szkoły.</h1></div>',u,'/it/school-info')
+    if not is_it(u):
+        return layout('403','<div class=card><h1>403</h1><p>Brak uprawnień.</p></div>',u,'/it/school-info')
+    if not row_get(u,'school_id'):
+        if u['role']=='it_admin':
+            body="<div class=card><h2>Nie wybrano szkoły</h2><p>Najpierw wybierz szkołę, którą chcesz edytować.</p><a class='btn' href='/it/schools'>Wybierz szkołę</a></div>"
+        else:
+            body="<div class=card><h2>Brak przypisanej szkoły</h2><p>Skontaktuj się z Administratorem IT.</p></div>"
+        return layout('Informacje szkoły',body,u,'/it/school-info')
     sc=one(c,'SELECT * FROM schools WHERE id=?',(u['school_id'],))
-    body=f"<div class=hero><div><h1>Informacje szkoły</h1><div class=muted>{esc(sc['name'])}</div></div></div><div class=grid><div class='card col6'><h3>Dane szkoły</h3><form class=form method=post action='/it/school-info'><input name=name value='{esc(sc['name'])}' required><input name=address value='{esc(sc['address'])}' placeholder='Adres'><input name=email value='{esc(sc['email'])}' placeholder='E-mail'><button class=btn>Zapisz</button></form></div><div class='card col6'><h3>Informacja na stronie logowania</h3><form class=form method=post action='/it/login-notice'><textarea name=login_notice>{esc(row_get(sc,'login_notice',''))}</textarea><button class=btn>Zapisz / edytuj</button></form><form method=post action='/it/login-notice/delete' style='margin-top:8px'><button class='btn red'>Usuń informację</button></form></div></div>"
+    if not sc:
+        return layout('Informacje szkoły','<div class=card><h2>Nie znaleziono szkoły.</h2></div>',u,'/it/school-info')
+    body=("<div class=hero><div><h1>Informacje szkoły</h1><div class=muted>Edytujesz: <b>%s</b></div></div></div>"
+          "<div class=grid><div class='card col6'><h3>Dane szkoły</h3>"
+          "<form class=form method=post action='/it/school-info'><label>Nazwa szkoły</label><input name=name value='%s' required>"
+          "<label>Adres</label><input name=address value='%s' placeholder='Adres'><label>E-mail</label><input name=email value='%s' placeholder='E-mail'>"
+          "<button class=btn>Zapisz informacje szkoły</button></form></div>"
+          "<div class='card col6'><h3>Informacja na stronie logowania</h3><p class=muted>Komunikat będzie widoczny na ekranie logowania.</p>"
+          "<form class=form method=post action='/it/login-notice'><textarea name=login_notice placeholder='Treść informacji'>%s</textarea><button class=btn>Zapisz / edytuj informację</button></form>"
+          "<form method=post action='/it/login-notice/delete' style='margin-top:8px'><button class='btn red'>Usuń informację</button></form></div></div>"
+          %(esc(sc['name']),esc(sc['name']),esc(sc['address']),esc(sc['email']),esc(row_get(sc,'login_notice',''))))
     return layout('Informacje szkoły',body,u,'/it/school-info')
 
 def it_staff_page(u,c):
@@ -726,11 +743,16 @@ def it_staff_page(u,c):
     return layout('Pracownicy IT',f"<div class=hero><div><h1>Pracownicy działu IT</h1><div class=muted>Każdy pracownik jest przypisany do jednej szkoły.</div></div></div><div class=grid>{form}<div class='card col7'><table class=table><tr><th>Pracownik</th><th>Szkoła</th><th>E-mail</th><th></th></tr>{rows}</table></div></div>",u,'/it/staff')
 
 def it_users_page(u,c):
-    if not is_it(u) or not u['school_id']: return layout('403','<div class=card><h1>Brak szkoły.</h1></div>',u,'/it/users')
-    teachers=q(c,"SELECT id,username,full_name,email FROM users WHERE school_id=? AND role='teacher' ORDER BY full_name",(u['school_id'],)); students=q(c,"SELECT st.id,us.full_name,us.username,cl.name class_name FROM students st JOIN users us ON us.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE us.school_id=? ORDER BY cl.name,us.full_name",(u['school_id'],))
-    tr=''.join(f"<tr><td><b>{esc(x['full_name'])}</b><br><small>{esc(x['email'] or '')}</small></td><td><form class=form method=post action='/it/teacher/{x['id']}/credentials'><input name=username value='{esc(x['username'])}' required><input type=password name=new_password placeholder='Nowe hasło (opcjonalnie)' minlength=4><button class='btn sm'>Zapisz dane logowania</button></form></td></tr>" for x in teachers) or '<tr><td colspan=2>Brak nauczycieli.</td></tr>'
-    sr=''.join(f"<tr><td>{esc(x['full_name'])}</td><td>{esc(x['class_name'] or '—')}</td><td><a class='btn sm gray' href='/student/{x['id']}'>Karta ucznia</a></td></tr>" for x in students) or '<tr><td colspan=3>Brak uczniów.</td></tr>'
-    return layout('Użytkownicy szkoły',f"<div class=hero><div><h1>Użytkownicy szkoły</h1><div class=muted>Dział IT może zmieniać login i hasło nauczycieli. Dane pedagogiczne pozostają tylko do wglądu.</div></div></div><div class=grid><div class='card col7'><h3>Nauczyciele</h3><table class=table><tr><th>Nauczyciel</th><th>Login / hasło</th></tr>{tr}</table></div><div class='card col5'><h3>Uczniowie</h3><table class=table><tr><th>Uczeń</th><th>Klasa</th><th></th></tr>{sr}</table></div></div>",u,'/it/users')
+    if not is_it(u) or not row_get(u,'school_id'):
+        return layout('403','<div class=card><h1>Brak szkoły.</h1><p>Administrator IT powinien wybrać edytowaną szkołę.</p></div>',u,'/it/users')
+    teachers=q(c,"SELECT id,username,full_name,email FROM users WHERE school_id=? AND role='teacher' ORDER BY full_name",(u['school_id'],))
+    students=q(c,"SELECT us.id user_id,st.id student_id,us.full_name,us.username,cl.name class_name FROM students st JOIN users us ON us.id=st.user_id LEFT JOIN classes cl ON cl.id=st.class_id WHERE us.school_id=? ORDER BY cl.name,us.full_name",(u['school_id'],))
+    def cred_form(uid,username):
+        return "<form class=form method=post action='/it/user/%s/credentials'><input name=username value='%s' required><input type=password name=new_password placeholder='Nowe hasło (opcjonalnie)' minlength=4><button class='btn sm'>Zapisz login / hasło</button></form>"%(uid,esc(username))
+    tr=''.join("<tr><td><b>%s</b><br><small>%s</small></td><td>%s</td></tr>"%(esc(x['full_name']),esc(x['email'] or ''),cred_form(x['id'],x['username'])) for x in teachers) or '<tr><td colspan=2>Brak nauczycieli.</td></tr>'
+    sr=''.join("<tr><td><b>%s</b></td><td>%s</td><td>%s</td></tr>"%(esc(x['full_name']),esc(x['class_name'] or '—'),cred_form(x['user_id'],x['username'])) for x in students) or '<tr><td colspan=3>Brak uczniów.</td></tr>'
+    body="<div class=hero><div><h1>Użytkownicy szkoły</h1><div class=muted>Dział IT może zmienić login i hasło nauczyciela lub ucznia w edytowanej szkole.</div></div></div><div class=grid><div class='card col6'><h3>Nauczyciele</h3><div class=table-scroll><table class=table><tr><th>Nauczyciel</th><th>Login / hasło</th></tr>%s</table></div></div><div class='card col6'><h3>Uczniowie</h3><div class=table-scroll><table class=table><tr><th>Uczeń</th><th>Klasa</th><th>Login / hasło</th></tr>%s</table></div></div></div>"%(tr,sr)
+    return layout('Użytkownicy szkoły',body,u,'/it/users')
 
 def it_students_page(u,c):
     if not is_it(u) or not u['school_id']: return layout('403','<div class=card><h1>Brak szkoły.</h1></div>',u,'/it/students')
@@ -873,49 +895,6 @@ class Handler(BaseHTTPRequestHandler):
                 except: selected_week=date.today()
                 out=schedule_page(u,c,selected_class_id,selected_week)
             elif path=='/calendar': out=calendar_page(u,c)
-            elif path=='/it/school/select' and u['role']=='it_admin':
-                sid=int(data['school_id'])
-                if not one(c,'SELECT id FROM schools WHERE id=?',(sid,)): raise ValueError('Nie znaleziono szkoły.')
-                if sess: sess['edit_school_id']=sid
-            elif path=='/it/school/create' and u['role']=='it_admin':
-                nsid=insert_id(c,'INSERT INTO schools(name,address,email) VALUES(?,?,?)',(data['school_name'].strip(),data.get('school_address',''),data.get('school_email','')))
-                c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(data['admin_username'].strip(),hpw(data['admin_password']),'admin',nsid,data['admin_name'].strip(),data.get('school_email','')))
-                if sess: sess['edit_school_id']=nsid
-            elif path.startswith('/it/school/') and path.endswith('/delete') and u['role']=='it_admin':
-                sid=int(path.split('/')[3])
-                if not one(c,'SELECT id FROM schools WHERE id=?',(sid,)): raise ValueError('Nie znaleziono szkoły.')
-                delete_school_data(c,sid)
-                if sess and sess.get('edit_school_id')==sid:
-                    nxt=one(c,'SELECT id FROM schools ORDER BY id LIMIT 1'); sess['edit_school_id']=nxt['id'] if nxt else None
-            elif path=='/it/school-info' and is_it(u):
-                if not u['school_id']: raise ValueError('Nie wybrano szkoły.')
-                c.execute('UPDATE schools SET name=?,address=?,email=? WHERE id=?',(data['name'].strip(),data.get('address',''),data.get('email',''),u['school_id']))
-            elif path=='/it/login-notice' and is_it(u):
-                c.execute('UPDATE schools SET login_notice=? WHERE id=?',(data.get('login_notice','').strip(),u['school_id']))
-            elif path=='/it/login-notice/delete' and is_it(u):
-                c.execute("UPDATE schools SET login_notice='' WHERE id=?",(u['school_id'],))
-            elif path=='/it/staff' and u['role']=='it_admin':
-                school_id=int(data['school_id'])
-                if not one(c,'SELECT id FROM schools WHERE id=?',(school_id,)): raise ValueError('Nieprawidłowa szkoła.')
-                c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email,info) VALUES(?,?,?,?,?,?,?)',(data['username'].strip(),hpw(data['password']),'it_staff',school_id,data['full_name'].strip(),data.get('email',''),'Pracownik działu IT'))
-            elif path.startswith('/it/staff/') and path.endswith('/delete') and u['role']=='it_admin':
-                iid=int(path.split('/')[3]); target=one(c,"SELECT id FROM users WHERE id=? AND role='it_staff'",(iid,))
-                if not target: raise ValueError('Nie znaleziono pracownika IT.')
-                c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(iid,iid)); c.execute("DELETE FROM users WHERE id=? AND role='it_staff'",(iid,))
-            elif path.startswith('/it/teacher/') and path.endswith('/credentials') and is_it(u):
-                tid=int(path.split('/')[3]); t=one(c,"SELECT id FROM users WHERE id=? AND role='teacher' AND school_id=?",(tid,u['school_id']))
-                if not t: raise ValueError('Nie znaleziono nauczyciela.')
-                username=data.get('username','').strip()
-                if not username: raise ValueError('Login jest wymagany.')
-                c.execute('UPDATE users SET username=? WHERE id=?',(username,tid))
-                if data.get('new_password'):
-                    if len(data['new_password'])<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
-                    c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(data['new_password']),tid))
-            elif path=='/it/journal' and u['role']=='it_admin':
-                name=data.get('journal_name','').strip()
-                if not name: raise ValueError('Nazwa dziennika jest wymagana.')
-                if DATABASE_URL: c.execute("INSERT INTO app_settings(key,value) VALUES('journal_name',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",(name,))
-                else: c.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('journal_name',?)",(name,))
             elif path.startswith('/calendar/event/') and path.endswith('/edit'): out=edit_calendar_event(u,c,int(path.split('/')[3]))
             elif path=='/attendance': out=attendance_page(u,c)
             elif path=='/grades': out=grades_page(u,c)
@@ -993,6 +972,67 @@ class Handler(BaseHTTPRequestHandler):
                 if theme not in ('blue','green','red'): raise ValueError('Nieprawidłowy kolor dziennika.')
                 c.execute('UPDATE users SET theme=? WHERE id=?',(theme,u['id']))
                 if sess: sess['user']['theme']=theme
+            elif path=='/it/school/select' and u['role']=='it_admin':
+                sid=int(data['school_id'])
+                if not one(c,'SELECT id FROM schools WHERE id=?',(sid,)): raise ValueError('Nie znaleziono szkoły.')
+                if sess: sess['edit_school_id']=sid
+            elif path=='/it/school/create' and u['role']=='it_admin':
+                school_name=data.get('school_name','').strip()
+                admin_name=data.get('admin_name','').strip()
+                admin_username=data.get('admin_username','').strip()
+                admin_password=data.get('admin_password','')
+                if not school_name or not admin_name or not admin_username: raise ValueError('Uzupełnij wymagane pola szkoły i administratora.')
+                if len(admin_password)<4: raise ValueError('Hasło administratora szkoły musi mieć co najmniej 4 znaki.')
+                if one(c,'SELECT id FROM users WHERE username=?',(admin_username,)): raise ValueError('Ten login jest już zajęty.')
+                nsid=insert_id(c,'INSERT INTO schools(name,address,email) VALUES(?,?,?)',(school_name,data.get('school_address','').strip(),data.get('school_email','').strip()))
+                c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email) VALUES(?,?,?,?,?,?)',(admin_username,hpw(admin_password),'admin',nsid,admin_name,data.get('school_email','').strip()))
+                if sess: sess['edit_school_id']=nsid
+            elif path.startswith('/it/school/') and path.endswith('/delete') and u['role']=='it_admin':
+                school_id=int(path.split('/')[3])
+                if not one(c,'SELECT id FROM schools WHERE id=?',(school_id,)): raise ValueError('Nie znaleziono szkoły.')
+                delete_school_data(c,school_id)
+                if sess and sess.get('edit_school_id')==school_id:
+                    nxt=one(c,'SELECT id FROM schools ORDER BY id LIMIT 1'); sess['edit_school_id']=nxt['id'] if nxt else None
+            elif path=='/it/school-info' and is_it(u):
+                if not row_get(u,'school_id'): raise ValueError('Nie wybrano szkoły.')
+                name=data.get('name','').strip()
+                if not name: raise ValueError('Nazwa szkoły jest wymagana.')
+                c.execute('UPDATE schools SET name=?,address=?,email=? WHERE id=?',(name,data.get('address','').strip(),data.get('email','').strip(),u['school_id']))
+                if sess and u['role']=='it_admin': sess['edit_school_id']=u['school_id']
+            elif path=='/it/login-notice' and is_it(u):
+                if not row_get(u,'school_id'): raise ValueError('Nie wybrano szkoły.')
+                c.execute('UPDATE schools SET login_notice=? WHERE id=?',(data.get('login_notice','').strip(),u['school_id']))
+            elif path=='/it/login-notice/delete' and is_it(u):
+                if not row_get(u,'school_id'): raise ValueError('Nie wybrano szkoły.')
+                c.execute("UPDATE schools SET login_notice='' WHERE id=?",(u['school_id'],))
+            elif path=='/it/staff' and u['role']=='it_admin':
+                school_id=int(data['school_id'])
+                if not one(c,'SELECT id FROM schools WHERE id=?',(school_id,)): raise ValueError('Nieprawidłowa szkoła.')
+                username=data.get('username','').strip(); password=data.get('password',''); full_name=data.get('full_name','').strip()
+                if not username or not full_name: raise ValueError('Login i imię i nazwisko są wymagane.')
+                if len(password)<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
+                if one(c,'SELECT id FROM users WHERE username=?',(username,)): raise ValueError('Ten login jest już zajęty.')
+                c.execute('INSERT INTO users(username,password_hash,role,school_id,full_name,email,info) VALUES(?,?,?,?,?,?,?)',(username,hpw(password),'it_staff',school_id,full_name,data.get('email','').strip(),'Pracownik działu IT'))
+            elif path.startswith('/it/staff/') and path.endswith('/delete') and u['role']=='it_admin':
+                iid=int(path.split('/')[3]); target=one(c,"SELECT id FROM users WHERE id=? AND role='it_staff'",(iid,))
+                if not target: raise ValueError('Nie znaleziono pracownika IT.')
+                c.execute('DELETE FROM messages WHERE sender_id=? OR recipient_id=?',(iid,iid)); c.execute("DELETE FROM users WHERE id=? AND role='it_staff'",(iid,))
+            elif ((path.startswith('/it/user/') or path.startswith('/it/teacher/')) and path.endswith('/credentials')) and is_it(u):
+                uid=int(path.split('/')[3])
+                target_user=one(c,"SELECT id,role FROM users WHERE id=? AND school_id=? AND role IN ('teacher','student')",(uid,u['school_id']))
+                if not target_user: raise ValueError('Nie znaleziono użytkownika w edytowanej szkole.')
+                username=data.get('username','').strip()
+                if not username: raise ValueError('Login jest wymagany.')
+                if one(c,'SELECT id FROM users WHERE username=? AND id<>?',(username,uid)): raise ValueError('Ten login jest już zajęty.')
+                c.execute('UPDATE users SET username=? WHERE id=?',(username,uid))
+                if data.get('new_password'):
+                    if len(data['new_password'])<4: raise ValueError('Hasło musi mieć co najmniej 4 znaki.')
+                    c.execute('UPDATE users SET password_hash=? WHERE id=?',(hpw(data['new_password']),uid))
+            elif path=='/it/journal' and u['role']=='it_admin':
+                name=data.get('journal_name','').strip()
+                if not name: raise ValueError('Nazwa dziennika jest wymagana.')
+                if DATABASE_URL: c.execute("INSERT INTO app_settings(key,value) VALUES('journal_name',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",(name,))
+                else: c.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES('journal_name',?)",(name,))
             elif path.startswith('/student/') and path.endswith('/password') and u['role']=='admin':
                 sid=int(path.split('/')[2]); st=one(c,'SELECT user_id FROM students st JOIN users us ON us.id=st.user_id WHERE st.id=? AND us.school_id=?',(sid,u['school_id']))
                 if not st: raise ValueError('Nie znaleziono ucznia.')
@@ -1296,7 +1336,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith('/it/school/') and path.endswith('/delete'): target='/it/schools'
         elif path=='/it/school-info' or path=='/it/login-notice' or path=='/it/login-notice/delete': target='/it/school-info'
         elif path.startswith('/it/staff'): target='/it/staff'
-        elif path.startswith('/it/teacher/'): target='/it/users'
+        elif path.startswith('/it/teacher/') or path.startswith('/it/user/'): target='/it/users'
         elif path=='/it/journal': target='/it/journal'
         elif path.startswith('/calendar/event/'): target='/calendar'
         elif path=='/calendar/event': target='/calendar'
@@ -1313,4 +1353,4 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(target)
 
 if __name__=='__main__':
-    init(); print(f'Super dziennik 4.12: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+    init(); print(f'Super dziennik 4.12.1: http://{HOST}:{PORT}'); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
