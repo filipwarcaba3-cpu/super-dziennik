@@ -145,6 +145,15 @@ def undo_it_change(c,a):
         if one(c,'SELECT id FROM users WHERE username=? AND id<>?',(data['username'],data['user_id'])): raise ValueError('Nie można cofnąć: poprzedni login jest obecnie zajęty.')
         c.execute('UPDATE users SET username=?,password_hash=? WHERE id=?',(data['username'],data['password_hash'],data['user_id']))
     elif action=='student_name': c.execute('UPDATE users SET full_name=? WHERE id=?',(data['full_name'],data['user_id']))
+    elif action=='class_create':
+        cid=data['class_id']
+        if one(c,'SELECT id FROM students WHERE class_id=? LIMIT 1',(cid,)) or one(c,'SELECT id FROM lessons WHERE class_id=? LIMIT 1',(cid,)) or one(c,'SELECT id FROM tests WHERE class_id=? LIMIT 1',(cid,)): raise ValueError('Nie można cofnąć utworzenia klasy, ponieważ klasa jest już używana.')
+        c.execute('DELETE FROM classes WHERE id=?',(cid,))
+    elif action=='class_edit': c.execute('UPDATE classes SET name=?,year=?,teacher_id=? WHERE id=?',(data['name'],data['year'],data.get('teacher_id'),data['class_id']))
+    elif action=='class_delete':
+        if one(c,'SELECT id FROM classes WHERE id=?',(data['class_id'],)): raise ValueError('Nie można cofnąć: klasa o tym identyfikatorze już istnieje.')
+        c.execute('INSERT INTO classes(id,school_id,name,year,teacher_id) VALUES(?,?,?,?,?)',(data['class_id'],data['school_id'],data['name'],data['year'],data.get('teacher_id')))
+        for sid in data.get('student_ids',[]): c.execute('UPDATE students SET class_id=? WHERE id=?',(data['class_id'],sid))
     elif action=='attendance_add': c.execute('DELETE FROM attendance WHERE id=?',(data['attendance_id'],))
     elif action=='attendance_edit': c.execute('UPDATE attendance SET date=?,status=?,subject_id=?,comment=? WHERE id=?',(data['date'],data['status'],data.get('subject_id'),data.get('comment',''),data['attendance_id']))
     elif action=='attendance_delete':
@@ -261,7 +270,7 @@ CSS='''
 
 def nav_items(role,path):
     if role in ('it_admin','it_staff'):
-        base=[('/dashboard','Pulpit IT','▦'),('/it/school-info','Informacje szkoły','⌂'),('/it/users','Użytkownicy szkoły','♙'),('/attendance','Frekwencja','✓'),('/it/students','Karty uczniów','♟'),('/messages','Wiadomości','✉')]
+        base=[('/dashboard','Pulpit IT','▦'),('/it/school-info','Informacje szkoły','⌂'),('/it/classes','Klasy','▤'),('/it/users','Użytkownicy szkoły','♙'),('/attendance','Frekwencja','✓'),('/it/students','Karty uczniów','♟'),('/messages','Wiadomości','✉')]
         if role=='it_admin':
             base.insert(1,('/it/schools','Szkoły','◆')); base += [('/it/staff','Pracownicy IT','⚙'),('/it/history','Historia zmian','↶'),('/it/journal','Informacje o dzienniku','A')]
     else:
@@ -281,7 +290,7 @@ def layout(title,body,u=None,path=''):
     it_class=' it-panel' if is_it(u) else ''; name=journal_name(); school_switch=''
     if u['role']=='it_admin':
         school_switch=f"<div class='it-school-box'><small>Edytowana szkoła</small><a href='/it/schools'>{esc(row_get(u,'editing_school_name','Wybierz szkołę'))}</a></div>"
-    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · {esc(name)}</title><style>{CSS}</style></head><body class='{theme_class}{it_class}'><div class='app'><aside class='side'><div class='logo'>{esc(name)} <span>4.14</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div>{school_switch}<nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>{'Dział IT' if is_it(u) else 'Szkoła'}</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
+    return f"<!doctype html><html lang='pl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#111827'><title>{esc(title)} · {esc(name)}</title><style>{CSS}</style></head><body class='{theme_class}{it_class}'><div class='app'><aside class='side'><div class='logo'>{esc(name)} <span>4.15</span></div><div class='who'><b>{esc(u['full_name'])}</b><small>{role}</small></div>{school_switch}<nav class='nav'>{nav_items(u['role'],path)}</nav><div class='nav logout'><a href='/profile' aria-label='Profil'><span>◉</span><span class='nav-label'>Profil</span></a></div></aside><main class='main'><header class='top'><h2>{esc(title)}</h2><div style='display:flex;align-items:center;gap:14px'><span class='muted'>{'Dział IT' if is_it(u) else 'Szkoła'}</span><a class='btn red' href='/logout' aria-label='Wyloguj się'>↪ Wyloguj się</a></div></header><nav class='mobile-nav'>{mobile_nav}<a href='/profile'><span>◉</span><span class='nav-label'>Profil</span></a></nav><section class='content'>{body}</section></main></div></body></html>"
 
 def login_page(msg=''):
     notices=''
@@ -290,7 +299,7 @@ def login_page(msg=''):
         notices=''.join(f"<div class='login-notice'><b>{esc(x['name'])}</b><br>{esc(x['login_notice'])}</div>" for x in rows)
     except Exception:
         notices=''
-    body=f"<!-- legacy compatibility: 4.0 --> <div class='login'><div class='loginbox'><div class='logo'>{esc(journal_name())} <span>4.14</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{notices}{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option><option value='it_staff'>Pracownik działu IT</option><option value='it_admin'>Administrator IT</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
+    body=f"<!-- legacy compatibility: 4.0 --> <div class='login'><div class='loginbox'><div class='logo'>{esc(journal_name())} <span>4.15</span></div><h1>Witaj ponownie</h1><p class='muted'>Zaloguj się do odpowiedniego panelu.</p>{notices}{('<div class=notice>'+esc(msg)+'</div>') if msg else ''}<form class='form' method='post' action='/login'><input name='username' placeholder='Login' required><input type='password' name='password' placeholder='Hasło' required><select name='role'><option value='auto'>Wykryj rolę automatycznie</option><option value='student'>Uczeń</option><option value='teacher'>Nauczyciel</option><option value='admin'>Administrator</option><option value='it_staff'>Pracownik działu IT</option><option value='it_admin'>Administrator IT</option></select><button class='btn'>Zaloguj się</button></form><p class='muted' style='font-size:12px;margin-top:18px'>Demo: admin/admin123 · nauczyciel/demo123 · uczen/demo123</p></div></div>"
     return layout('Logowanie',body)
 
 def student_id(c,u): return one(c,'SELECT id FROM students WHERE user_id=?',(u['id'],))['id']
@@ -603,14 +612,15 @@ def lessons_page(u,c):
     sy_start,sy_end=school_year_bounds()
     student_checks=''.join(f"<label class='student-pick'><input type=checkbox name='student_{st['id']}' value=1> <span>{esc(st['full_name'])}<small>{' · '+esc(st['class_name']) if st['class_name'] else ''}</small></span></label>" for st in students)
     form=("<div class='card col12'><h3>Dodaj lekcję</h3><p class=muted>Wybierz lekcję grupową dla całej klasy albo indywidualną dla jednego lub kilku uczniów.</p><form class=form method=post action=/lesson>"
-          "<div class=row><label>Rodzaj zajęć<select name=lesson_type id=lessonType onchange=toggleLessonType()><option value=group>Lekcja grupowa</option><option value=individual>Lekcja indywidualna</option></select></label><label>Przedmiot<select name=subject_id required>"+opts(subjects,'id','name')+"</select></label></div>"
+          "<div class=row><label>Rodzaj zajęć<select name=lesson_type id=lessonType onchange=toggleLessonType()><option value=group>Lekcja grupowa</option><option value=individual>Lekcja indywidualna</option></select></label><label>Przedmiot<select name=subject_id id=subjectSelect required onchange=toggleOtherSubject()>"+opts(subjects,'id','name')+"<option value='__other__'>Inne</option></select></label></div>"
+          "<div id=otherSubjectBox style='display:none'><label>Nazwa<input name=other_subject_name id=otherSubjectName placeholder='Nazwa wydarzenia / zajęć'></label></div>"
           "<div id=groupBox><label>Klasa<select name=class_id id=classSelect>"+opts(classes,'id','name')+"</select></label></div>"
           "<div id=individualBox style='display:none'><label>Uczniowie</label><div class=student-picker>"+(student_checks or '<span class=muted>Brak uczniów.</span>')+"</div><small class=muted>Możesz zaznaczyć jednego lub kilku uczniów z całej szkoły.</small></div>"
           "<div class=row><select name=teacher_id"+disabled+">"+teacher_select+"</select><select name=weekday><option value=1>Poniedziałek</option><option value=2>Wtorek</option><option value=3>Środa</option><option value=4>Czwartek</option><option value=5>Piątek</option></select></div>"
           "<div class=row><input name=start_time type=time value='08:00' required><input name=end_time type=time value='08:45' required></div>"
           "<div class=row><select name=recurrence id=recurrenceSelect onchange=toggleRecurrence()><option value=none>Nie powtarzaj</option><option value=weekly selected>Co tydzień</option><option value=biweekly>Co dwa tygodnie</option><option value=monthly>Co miesiąc</option></select><input name=room placeholder='Sala'></div>"
           f"<div class=row><label>Od kiedy<input name=date_from id=dateFrom type=date value='{sy_start.isoformat()}' required></label><label id=dateToLabel>Do kiedy<input name=date_to id=dateTo type=date value='{sy_end.isoformat()}' required></label></div>"
-          "<button class=btn>Dodaj lekcję</button></form><script>function toggleLessonType(){let i=document.getElementById('lessonType').value==='individual';document.getElementById('groupBox').style.display=i?'none':'block';document.getElementById('individualBox').style.display=i?'block':'none';}function toggleRecurrence(){let n=document.getElementById('recurrenceSelect').value==='none';document.getElementById('dateToLabel').style.display=n?'none':'block';if(n)document.getElementById('dateTo').value=document.getElementById('dateFrom').value;}document.getElementById('dateFrom').addEventListener('change',function(){if(document.getElementById('recurrenceSelect').value==='none')document.getElementById('dateTo').value=this.value;});</script></div>")
+          "<button class=btn>Dodaj lekcję</button></form><script>function toggleLessonType(){let i=document.getElementById('lessonType').value==='individual';document.getElementById('groupBox').style.display=i?'none':'block';document.getElementById('individualBox').style.display=i?'block':'none';}function toggleOtherSubject(){let o=document.getElementById('subjectSelect').value==='__other__';document.getElementById('otherSubjectBox').style.display=o?'block':'none';document.getElementById('otherSubjectName').required=o;}function toggleRecurrence(){let n=document.getElementById('recurrenceSelect').value==='none';document.getElementById('dateToLabel').style.display=n?'none':'block';if(n)document.getElementById('dateTo').value=document.getElementById('dateFrom').value;}document.getElementById('dateFrom').addEventListener('change',function(){if(document.getElementById('recurrenceSelect').value==='none')document.getElementById('dateTo').value=this.value;});toggleOtherSubject();</script></div>")
     dn={1:'Pon.',2:'Wt.',3:'Śr.',4:'Czw.',5:'Pt.'}; table='<div class=table-scroll><table class=table><tr><th>Dzień</th><th>Godzina</th><th>Rodzaj</th><th>Klasa / uczniowie</th><th>Przedmiot</th><th>Nauczyciel</th><th>Sala</th><th>Powtarzalność</th><th>Okres</th><th>Akcje</th></tr>'
     for x in rows:
         period=esc(row_get(x,'date_from') or 'bez początku') if row_get(x,'recurrence')=='none' else (esc(row_get(x,'date_from') or 'bez początku')+' – '+esc(row_get(x,'date_to') or 'bez końca'))
@@ -824,6 +834,18 @@ def it_users_page(u,c):
     body="<div class=hero><div><h1>Użytkownicy szkoły</h1><div class=muted>Dział IT może dodawać użytkowników i zmieniać dane logowania. Administrator IT może dodatkowo blokować konta oraz usuwać uczniów.</div></div></div><div class=grid>"+add_teacher+add_student+"<div class='card col6'><h3>Nauczyciele</h3><div class=table-scroll><table class=table><tr><th>Nauczyciel</th><th>Login / hasło</th><th>Status / akcje</th></tr>"+tr+"</table></div></div><div class='card col6'><h3>Uczniowie</h3><div class=table-scroll><table class=table><tr><th>Uczeń / imię i nazwisko</th><th>Klasa</th><th>Login / hasło</th><th>Status / akcje</th></tr>"+sr+"</table></div></div></div>"
     return layout('Użytkownicy szkoły',body,u,'/it/users')
 
+def it_classes_page(u,c):
+    if not is_it(u) or not row_get(u,'school_id'):
+        return layout('403','<div class=card><h1>Brak szkoły.</h1><p>Administrator IT powinien wybrać edytowaną szkołę.</p></div>',u,'/it/classes')
+    classes=q(c,'SELECT cl.*,us.full_name teacher,(SELECT COUNT(*) FROM students st WHERE st.class_id=cl.id) n FROM classes cl LEFT JOIN users us ON us.id=cl.teacher_id WHERE cl.school_id=? ORDER BY cl.name',(u['school_id'],))
+    teachers=q(c,"SELECT id,full_name FROM users WHERE role='teacher' AND school_id=? ORDER BY full_name",(u['school_id'],))
+    add="<div class='card'><h3>Dodaj klasę</h3><form class=form method=post action='/it/class'><div class=row><input name=name placeholder='np. 1A' required><input name=year type=number min=1 max=20 value=1 required></div><select name=teacher_id><option value=''>Bez wychowawcy</option>"+opts(teachers,'id','full_name')+"</select><button class=btn>Dodaj klasę</button></form></div>"
+    cards=[]
+    for cl in classes:
+        teacher_opts="<option value=''>Bez wychowawcy</option>"+opts(teachers,'id','full_name',cl['teacher_id'])
+        cards.append(f"<div class=card><h3>{esc(cl['name'])}</h3><p class=muted>Rocznik {esc(cl['year'])} · wychowawca: {esc(cl['teacher'] or '—')} · uczniów: {cl['n']}</p><form class=form method=post action='/it/class/{cl['id']}/edit'><div class=row><input name=name value='{esc(cl['name'])}' required><input name=year type=number min=1 max=20 value='{esc(cl['year'])}' required></div><select name=teacher_id>{teacher_opts}</select><button class='btn sm gray'>Zapisz zmiany</button></form><form method=post action='/it/class/{cl['id']}/delete' onsubmit=\"return confirm('Usunąć klasę? Uczniowie zostaną bez przypisanej klasy. Klasy z planem lekcji lub sprawdzianami nie można usunąć.')\" style='margin-top:10px'><button class='btn sm red'>Usuń klasę</button></form></div>")
+    return layout('Klasy',"<div class=hero><div><h1>Klasy</h1><div class=muted>Dział IT może dodawać, edytować i usuwać klasy w aktualnie obsługiwanej szkole.</div></div></div><div class=grid><div class=col12>"+add+"</div>"+''.join("<div class=col4>"+x+"</div>" for x in cards)+"</div>",u,'/it/classes')
+
 def it_history_page(u,c):
     if u['role']!='it_admin': return layout('403','<div class=card><h1>403</h1></div>',u,'/it/history')
     rows=q(c,"SELECT a.*,us.full_name actor,sc.name school_name FROM it_audit a JOIN users us ON us.id=a.actor_id LEFT JOIN schools sc ON sc.id=a.school_id ORDER BY a.id DESC LIMIT 300")
@@ -994,6 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path=='/it/school-info': out=it_school_info_page(u,c)
             elif path=='/it/staff': out=it_staff_page(u,c)
             elif path=='/it/users': out=it_users_page(u,c)
+            elif path=='/it/classes': out=it_classes_page(u,c)
             elif path=='/it/students': out=it_students_page(u,c)
             elif path=='/it/journal': out=it_journal_page(u,c)
             elif path=='/it/history': out=it_history_page(u,c)
@@ -1160,6 +1183,37 @@ class Handler(BaseHTTPRequestHandler):
                     stid=insert_id(c,'INSERT INTO students(user_id,class_id) VALUES(?,?)',(uid,int(cid) if cid else None))
                     for sub in q(c,'SELECT id FROM subjects WHERE school_id=?',(u['school_id'],)): c.execute('INSERT INTO enrollments(student_id,subject_id) VALUES(?,?) ON CONFLICT (student_id,subject_id) DO NOTHING',(stid,sub['id']))
                 audit_it(c,u,'user_create',('Dodanie ucznia: ' if role=='student' else 'Dodanie nauczyciela: ')+full_name,{'user_id':uid,'student_id':stid})
+            elif path=='/it/class' and is_it(u):
+                if not row_get(u,'school_id'): raise ValueError('Nie wybrano szkoły.')
+                name=data.get('name','').strip()
+                if not name: raise ValueError('Nazwa klasy jest wymagana.')
+                year=int(data.get('year','1') or 1)
+                teacher_id=data.get('teacher_id') or None
+                if teacher_id:
+                    teacher_id=int(teacher_id)
+                    if not one(c,"SELECT id FROM users WHERE id=? AND role='teacher' AND school_id=?",(teacher_id,u['school_id'])): raise ValueError('Nieprawidłowy wychowawca.')
+                cid=insert_id(c,'INSERT INTO classes(school_id,name,year,teacher_id) VALUES(?,?,?,?)',(u['school_id'],name,year,teacher_id))
+                audit_it(c,u,'class_create','Dodanie klasy: '+name,{'class_id':cid})
+            elif path.startswith('/it/class/') and path.endswith('/edit') and is_it(u):
+                cid=int(path.split('/')[3]); cl=one(c,'SELECT * FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
+                if not cl: raise ValueError('Nie znaleziono klasy w tej szkole.')
+                name=data.get('name','').strip()
+                if not name: raise ValueError('Nazwa klasy jest wymagana.')
+                year=int(data.get('year','1') or 1); teacher_id=data.get('teacher_id') or None
+                if teacher_id:
+                    teacher_id=int(teacher_id)
+                    if not one(c,"SELECT id FROM users WHERE id=? AND role='teacher' AND school_id=?",(teacher_id,u['school_id'])): raise ValueError('Nieprawidłowy wychowawca.')
+                audit_it(c,u,'class_edit','Edycja klasy: '+cl['name'],{'class_id':cid,'name':cl['name'],'year':cl['year'],'teacher_id':row_get(cl,'teacher_id')})
+                c.execute('UPDATE classes SET name=?,year=?,teacher_id=? WHERE id=? AND school_id=?',(name,year,teacher_id,cid,u['school_id']))
+            elif path.startswith('/it/class/') and path.endswith('/delete') and is_it(u):
+                cid=int(path.split('/')[3]); cl=one(c,'SELECT * FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
+                if not cl: raise ValueError('Nie znaleziono klasy w tej szkole.')
+                if one(c,'SELECT id FROM lessons WHERE class_id=? LIMIT 1',(cid,)) or one(c,'SELECT id FROM tests WHERE class_id=? LIMIT 1',(cid,)):
+                    raise ValueError('Nie można usunąć klasy, która ma zaplanowane lekcje lub sprawdziany. Najpierw usuń te powiązania.')
+                student_ids=[r['id'] for r in q(c,'SELECT id FROM students WHERE class_id=?',(cid,))]
+                audit_it(c,u,'class_delete','Usunięcie klasy: '+cl['name'],{'class_id':cid,'school_id':u['school_id'],'name':cl['name'],'year':cl['year'],'teacher_id':row_get(cl,'teacher_id'),'student_ids':student_ids})
+                c.execute('UPDATE students SET class_id=NULL WHERE class_id=?',(cid,))
+                c.execute('DELETE FROM classes WHERE id=? AND school_id=?',(cid,u['school_id']))
             elif path.startswith('/it/student/') and path.endswith('/name') and is_it(u):
                 stid=int(path.split('/')[3]); st=one(c,'SELECT st.user_id,us.full_name FROM students st JOIN users us ON us.id=st.user_id WHERE st.id=? AND us.school_id=?',(stid,u['school_id']))
                 if not st: raise ValueError('Nie znaleziono ucznia w edytowanej szkole.')
@@ -1441,7 +1495,21 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     cid=int(data['class_id'])
                 tid=u['id'] if u['role']=='teacher' else int(data['teacher_id'])
-                lid=insert_id(c,'INSERT INTO lessons(class_id,subject_id,teacher_id,weekday,start_time,end_time,room,recurrence,date_from,date_to,lesson_type) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(cid,data['subject_id'],tid,int(data['weekday']),data['start_time'],data['end_time'],data.get('room',''),recurrence,dfrom.isoformat(),dto.isoformat(),lesson_type))
+                subject_value=data.get('subject_id','')
+                if subject_value=='__other__':
+                    custom_name=data.get('other_subject_name','').strip()
+                    if not custom_name: raise ValueError('Wpisz nazwę wydarzenia / zajęć.')
+                    existing=one(c,'SELECT id FROM subjects WHERE school_id=? AND LOWER(name)=LOWER(?)',(u['school_id'],custom_name))
+                    if existing: subject_id=existing['id']
+                    else:
+                        subject_id=insert_id(c,'INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(u['school_id'],custom_name,custom_name[:12]))
+                        for st in q(c,'SELECT id FROM students WHERE class_id IN (SELECT id FROM classes WHERE school_id=?)',(u['school_id'],)):
+                            c.execute('INSERT INTO enrollments(student_id,subject_id) VALUES(?,?) ON CONFLICT (student_id,subject_id) DO NOTHING',(st['id'],subject_id))
+                else:
+                    try: subject_id=int(subject_value)
+                    except: raise ValueError('Wybierz przedmiot.')
+                    if not one(c,'SELECT id FROM subjects WHERE id=? AND school_id=?',(subject_id,u['school_id'])): raise ValueError('Nieprawidłowy przedmiot.')
+                lid=insert_id(c,'INSERT INTO lessons(class_id,subject_id,teacher_id,weekday,start_time,end_time,room,recurrence,date_from,date_to,lesson_type) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(cid,subject_id,tid,int(data['weekday']),data['start_time'],data['end_time'],data.get('room',''),recurrence,dfrom.isoformat(),dto.isoformat(),lesson_type))
                 if lesson_type=='individual':
                     for sid in selected: c.execute('INSERT INTO lesson_students(lesson_id,student_id) VALUES(?,?) ON CONFLICT (lesson_id,student_id) DO NOTHING',(lid,sid))
             elif path.startswith('/lesson/') and path.endswith('/edit') and u['role'] in ('admin','teacher'):
@@ -1480,6 +1548,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith('/student/') and path.endswith('/password'): target='/student/'+path.split('/')[2]
         elif path.startswith('/student/') and (path.endswith('/delete') or path.endswith('/class')): target='/users'
         elif path=='/subject' or path.startswith('/subject/'): target='/subjects'
+        elif path.startswith('/it/class'): target='/it/classes'
         elif path.startswith('/it/user/') or path.startswith('/it/student/'): target='/it/users'
         elif path.startswith('/grade'): target='/grades'
         elif path.startswith('/attendance'): target='/attendance'

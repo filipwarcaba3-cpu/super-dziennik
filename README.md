@@ -1,14 +1,15 @@
-# Super dziennik 4.14
+# Super dziennik 4.15
 
-Zmiany względem 4.13.1:
+Zmiany względem 4.14:
 
-- Administrator IT może usuwać uczniów z aktualnie edytowanej szkoły.
-- Administrator IT może blokować i odblokowywać konta uczniów i nauczycieli.
-- Zablokowany uczeń lub nauczyciel po zalogowaniu widzi czerwony komunikat: „Twoje konto zostało zablokowane przez administratora IT. Aby je odblokować skontaktuj się z twoim dyrektorem.” oraz przycisk wylogowania.
-- Pracownik IT nie może blokować, odblokowywać ani usuwać uczniów.
-- Przy wystawianiu oceny przez nauczyciela lub administratora można wybrać kolor: czerwony, zielony, niebieski, czarny albo fioletowy.
-- Uczeń widzi ocenę w wybranym kolorze w dziale Oceny oraz w szczegółach lekcji.
-- Kolor można także zmienić przy edycji istniejącej oceny.
-- Migracja bazy dodaje jedynie kolumnę `grades.color`; dotychczasowe oceny otrzymują kolor czarny.
+- W planowaniu lekcji lista „Przedmiot” zawiera nową pozycję „Inne”.
+- Po wybraniu „Inne” pojawia się pole „Nazwa”, w którym można wpisać własną nazwę wydarzenia / zajęć.
+- Przy zapisie własna nazwa jest automatycznie dodawana jako przedmiot w danej szkole (jeśli jeszcze nie istnieje) i używana w planie lekcji.
+- Dział IT otrzymał nowy panel „Klasy”.
+- Administrator IT może dodawać, edytować i usuwać klasy w aktualnie edytowanej szkole.
+- Pracownik IT może dodawać, edytować i usuwać klasy wyłącznie w przypisanej do niego szkole.
+- Przy klasie można zmienić nazwę, rocznik i wychowawcę.
+- Usunięcie klasy pozostawia uczniów w systemie jako „bez klasy”. Ze względów bezpieczeństwa nie można usunąć klasy, która ma jeszcze zaplanowane lekcje lub sprawdziany.
+- Zmiany klas wykonywane przez pracownika IT trafiają do Historii zmian; dodanie i edycję można cofnąć, a usunięcie pustej klasy można odtworzyć wraz z poprzednimi przypisaniami uczniów.
 
-Aplikacja nadal korzysta z tej samej bazy Neon przez `DATABASE_URL`.
+Aplikacja nadal korzysta z tej samej bazy Neon przez `DATABASE_URL` i nie wymaga tworzenia nowej bazy.
