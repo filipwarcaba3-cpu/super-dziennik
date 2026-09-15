@@ -1,10 +1,8 @@
-# Super dziennik 4.17
+# Super dziennik 4.17.1
 
-Zmiany:
-- przy karcie lekcji obok OCENY i ZAPLANUJ SPRAWDZIAN jest DODAJ POCHWAŁĘ LUB UWAGĘ,
-- sprawdzian/kartkówkę można przypisać do konkretnej nadchodzącej lekcji zamiast tylko wpisywać datę,
-- zaplanowany typ i nazwa są pokazywane na czerwono na planie nauczyciela i ucznia,
-- typ kolumny ocen „Inne” pokazuje pole własnej nazwy,
-- własny typ można zapisać na liście typów ocen do ponownego użycia.
-
-Baza PostgreSQL/Neon jest migrowana automatycznie bez kasowania dotychczasowych danych.
+Poprawki:
+- naprawione uruchamianie planu lekcji,
+- przy planowaniu sprawdzianu po wyborze przedmiotu lista terminów pokazuje tylko lekcje z tego przedmiotu,
+- lista zawiera kolejne wystąpienia lekcji, a nie tylko jeden najbliższy termin,
+- wybór lekcji automatycznie ustawia klasę i datę,
+- zaplanowany sprawdzian/kartkówka nadal jest oznaczany na czerwono na właściwej lekcji.
