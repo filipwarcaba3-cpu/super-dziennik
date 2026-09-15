@@ -1,12 +1,10 @@
-# Super dziennik 4.16
+# Super dziennik 4.17
 
-Nowa karta lekcji wzorowana na przesłanych przykładach:
-- po wejściu w lekcję nauczyciel/administrator ma zakładki **Temat i obecność** oraz **Oceny**,
-- temat i frekwencja są uzupełniane dla konkretnego wystąpienia lekcji,
-- zakładka **Oceny** pokazuje tabelę całej klasy dla danego przedmiotu,
-- przyciskiem **+** można utworzyć wspólną kolumnę ocen (np. „Kartkówka 1”) dla wszystkich uczniów,
-- kolumna ma wspólną nazwę, wagę i kolor,
-- oceny można wpisać uczniom bezpośrednio w komórkach tabeli i zapisać całą klasę naraz,
-- zachowano dotychczasowe funkcje Super dziennika 4.15.
+Zmiany:
+- przy karcie lekcji obok OCENY i ZAPLANUJ SPRAWDZIAN jest DODAJ POCHWAŁĘ LUB UWAGĘ,
+- sprawdzian/kartkówkę można przypisać do konkretnej nadchodzącej lekcji zamiast tylko wpisywać datę,
+- zaplanowany typ i nazwa są pokazywane na czerwono na planie nauczyciela i ucznia,
+- typ kolumny ocen „Inne” pokazuje pole własnej nazwy,
+- własny typ można zapisać na liście typów ocen do ponownego użycia.
 
-Baza Neon jest migrowana automatycznie: dodawana jest tabela `grade_columns` i pole `column_id` w `grades`. Istniejące dane nie są kasowane.
+Baza PostgreSQL/Neon jest migrowana automatycznie bez kasowania dotychczasowych danych.
