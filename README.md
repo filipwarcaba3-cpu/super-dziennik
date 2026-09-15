@@ -1,4 +1,4 @@
-# Super dziennik 4.18
+# Super dziennik 4.19
 
 Zmiany:
 - edycja kolumn ocen (typ, nazwa, waga, kolor),
