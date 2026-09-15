@@ -1,10 +1,10 @@
-# Super dziennik 4.20
+# Super dziennik 4.21
 
 Zmiany:
-- naprawione otwieranie karty ucznia z karty ocen,
-- nazwisko ucznia przy sprawdzaniu obecności jest klikalne,
-- kliknięcie nazwiska ucznia nie otwiera profilu od razu: pojawia się małe potwierdzenie „Czy pokazać kartę ucznia?” z przyciskami „Pokaż” i „Nie pokazuj”,
-- ten sam mechanizm zastosowano w miejscach, w których nazwisko ucznia prowadzi do jego karty,
-- „Pokaż” otwiera kartę ucznia, „Nie pokazuj” zamyka prostokąt.
-
-Baza danych nie wymaga zmian.
+- naprawione otwieranie karty ucznia (usunięty błąd powodujący HTTP 502),
+- potwierdzenie „Czy pokazać kartę ucznia?” działa także przy sprawdzaniu obecności,
+- przy planowaniu sprawdzianu lista lekcji jest filtrowana jednocześnie po wybranej klasie i przedmiocie,
+- karta wpisywania tematu/obecności jest żółta bez tematu i zielona po zapisaniu tematu,
+- brak frekwencji choćby jednego ucznia pokazuje czerwony wykrzyknik na planie nauczyciela,
+- wewnątrz lekcji widoczny jest czerwony komunikat „Nie sprawdzona obecność”,
+- ostrzeżenie znika dopiero po zapisaniu frekwencji wszystkim uczniom.
