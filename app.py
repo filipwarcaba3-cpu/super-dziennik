@@ -203,11 +203,10 @@ def init():
         c.execute("ALTER TABLE announcements ADD COLUMN IF NOT EXISTS created_by INTEGER")
         c.execute("UPDATE users SET theme='blue' WHERE theme IS NULL OR theme=''")
         c.execute("UPDATE lessons SET recurrence='weekly' WHERE recurrence IS NULL OR recurrence=''")
-    try:
-        c.execute('ALTER TABLE grades ADD COLUMN column_id INTEGER')
-    except Exception:
-        try: c.rollback()
-        except: pass
+    # PostgreSQL migrations must not be rolled back by an expected duplicate-column error.
+    # Use IF NOT EXISTS so newer columns (including tests.target_lesson_id) remain committed.
+    if DATABASE_URL:
+        c.execute('ALTER TABLE grades ADD COLUMN IF NOT EXISTS column_id INTEGER')
     # Legacy SQLite migrations are needed only when running without DATABASE_URL.
 
     if not DATABASE_URL:

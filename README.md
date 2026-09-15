@@ -1,8 +1,7 @@
-# Super dziennik 4.17.1
+# Super dziennik 4.17.2
 
-Poprawki:
-- naprawione uruchamianie planu lekcji,
-- przy planowaniu sprawdzianu po wyborze przedmiotu lista terminów pokazuje tylko lekcje z tego przedmiotu,
-- lista zawiera kolejne wystąpienia lekcji, a nie tylko jeden najbliższy termin,
-- wybór lekcji automatycznie ustawia klasę i datę,
-- zaplanowany sprawdzian/kartkówka nadal jest oznaczany na czerwono na właściwej lekcji.
+Poprawka błędu HTTP 502 na Render/Neon przy otwieraniu planu lekcji i po planowaniu sprawdzianu.
+
+Przyczyna: migracja PostgreSQL wykonywała ALTER TABLE dla istniejącej kolumny, a późniejszy rollback cofał nowe migracje, m.in. `tests.target_lesson_id`. Wersja 4.17.2 używa bezpiecznego `ADD COLUMN IF NOT EXISTS` i nie cofa prawidłowych migracji.
+
+Dane w Neon nie są usuwane.
