@@ -633,14 +633,14 @@ def lesson_gradebook(u,c,l,day):
     else:
         students=q(c,'SELECT st.id,u.full_name FROM students st JOIN users u ON u.id=st.user_id WHERE st.class_id=? ORDER BY u.full_name',(l['class_id'],))
     cols=q(c,'SELECT * FROM grade_columns WHERE class_id=? AND subject_id=? ORDER BY id',(l['class_id'],l['subject_id']))
-    head="<th class=student-name>Uczeń</th>"+''.join(f"<th><small>{esc(row_get(x,'category','Inne'))}</small><br>{esc(x['name'])}<br><small>waga {esc(x['weight'])}</small></th>" for x in cols)
+    head="<th class=student-name>Uczeń</th>"+''.join(f"<th><small>{esc(row_get(x,'category','Inne'))}</small><br>{esc(x['name'])}<br><small>waga {esc(x['weight'])}</small><div style='margin-top:7px;display:flex;gap:5px;justify-content:center'><a class='btn sm gray' href='/lesson/{l['id']}/grade-column/{x['id']}/edit?date={day.isoformat()}'>Edytuj</a><form method='post' action='/lesson/{l['id']}/grade-column/{x['id']}/delete' style='display:inline' onsubmit=\"return confirm('Usunąć tę kolumnę i wszystkie oceny w tej kolumnie?')\"><input type='hidden' name='date' value='{day.isoformat()}'><button class='btn sm red'>Usuń</button></form></div></th>" for x in cols)
     bodyrows=''
     for st in students:
         cells=''
         for col in cols:
             g=one(c,'SELECT id,value,color FROM grades WHERE student_id=? AND column_id=? ORDER BY id DESC LIMIT 1',(st['id'],col['id']))
             cells += f"<td><input name='g_{st['id']}_{col['id']}' value='{esc(g['value']) if g else ''}' style='color:{grade_color(row_get(g,'color',row_get(col,'color','black')) if g else row_get(col,'color','black'))}' placeholder='—'></td>"
-        bodyrows += f"<tr><td class=student-name><b>{esc(st['full_name'])}</b></td>{cells}</tr>"
+        bodyrows += f"<tr><td class=student-name><a href='/student/{st['id']}' style='font-weight:800;text-decoration:none'>{esc(st['full_name'])}</a></td>{cells}</tr>"
     if not cols: bodyrows=f"<tr><td class=student-name colspan=2>Najpierw dodaj kolumnę ocen przyciskiem +.</td></tr>"
     custom_cats=q(c,'SELECT name FROM grade_categories WHERE school_id=? ORDER BY name',(u['school_id'],))
     catopts=''.join(f"<option>{esc(x['name'])}</option>" for x in custom_cats)
@@ -648,6 +648,20 @@ def lesson_gradebook(u,c,l,day):
     grid=f"<form method=post action='/lesson/{l['id']}/gradebook'><input type=hidden name=date value='{day.isoformat()}'><div class=gradebook><table><tr>{head}</tr>{bodyrows}</table></div>{'<button class=btn style=\"margin-top:12px\">Zapisz oceny całej klasy</button>' if cols else ''}</form>"
     tabs=f"<div class=lesson-tabs><a class='btn gray' href='/lesson/{l['id']}?date={day.isoformat()}'>Temat i obecność</a><a class=btn href='/lesson/{l['id']}/grades?date={day.isoformat()}'>Oceny</a></div>"
     return layout('Oceny klasy',f"<div class=hero><div><h1>Karta z ocenami</h1><div class=muted>{esc(l['subject'])} · {esc(l['class_name'])} · {day.strftime('%d.%m.%Y')}</div></div></div>{tabs}<div class='grid'><div class='card col12'><h3>Dodaj kolumnę ocen dla całej klasy</h3><p class=muted>Kliknij + po wpisaniu nazwy. Ta sama nazwa kolumny pojawi się przy wszystkich uczniach.</p>{add}</div><div class='card col12'><h3>Oceny całej klasy</h3>{grid}</div></div>",u,'/schedule')
+
+def edit_grade_column_page(u,c,l,col,day):
+    if u['role'] not in ('admin','teacher') or not l or not col:
+        return layout('403','<div class=card><h1>403</h1></div>',u)
+    if u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']:
+        return layout('403','<div class=card><h1>403</h1></div>',u)
+    custom_cats=q(c,'SELECT name FROM grade_categories WHERE school_id=? ORDER BY name',(u['school_id'],))
+    standard=['Sprawdzian','Kartkówka','Odpowiedź ustna','Praca domowa','Aktywność','Projekt']
+    names=standard+[x['name'] for x in custom_cats]
+    current=str(row_get(col,'category','Inne'))
+    if current not in names: names.append(current)
+    catopts=''.join(f"<option {'selected' if x==current else ''}>{esc(x)}</option>" for x in names)
+    body=f"""<div class=hero><div><h1>Edytuj kolumnę ocen</h1><div class=muted>{esc(l['subject'])} · {esc(l['class_name'])}</div></div></div><div class='card'><form class=form method=post action='/lesson/{l['id']}/grade-column/{col['id']}/edit'><input type=hidden name=date value='{day.isoformat()}'><label>Rodzaj oceny<select name=category>{catopts}</select></label><label>Nazwa<input name=name value='{esc(col['name'])}' required></label><div class=row><label>Waga<input name=weight type=number step=.5 min=.5 value='{esc(col['weight'])}'></label><label>Kolor<select name=color>{grade_color_options(row_get(col,'color','black'))}</select></label></div><div style='display:flex;gap:8px'><button class=btn>Zapisz zmiany</button><a class='btn gray' href='/lesson/{l['id']}/grades?date={day.isoformat()}'>Anuluj</a></div></form></div>"""
+    return layout('Edytuj kolumnę ocen',body,u,'/schedule')
 
 def lessons_page(u,c):
     if u['role'] not in ('admin','teacher'): return schedule_page(u,c)
@@ -1095,6 +1109,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith('/student/') and path.endswith('/behavior'): out=behavior_page(u,c,int(path.split('/')[2]))
             elif path.startswith('/class/') and path.endswith('/edit'): out=edit_class(u,c,int(path.split('/')[2]))
             elif path.startswith('/student/'): out=student_page(u,c,int(path.split('/')[2]))
+            elif path.startswith('/lesson/') and '/grade-column/' in path and path.endswith('/edit'):
+                parts=path.strip('/').split('/'); lid=int(parts[1]); colid=int(parts[3])
+                l=one(c,'SELECT l.*,cl.name class_name,cl.teacher_id homeroom,s.name subject FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                col=one(c,'SELECT * FROM grade_columns WHERE id=? AND class_id=? AND subject_id=?',(colid,l['class_id'],l['subject_id'])) if l else None
+                qdate=parse_qs(urlparse(self.path).query).get('date',[date.today().isoformat()])[0]
+                try: day=date.fromisoformat(qdate)
+                except: day=date.today()
+                out=edit_grade_column_page(u,c,l,col,day)
             elif path.startswith('/lesson/') and path.endswith('/grades'):
                 lid=int(path.split('/')[2]); l=one(c,'SELECT l.*,cl.name class_name,cl.teacher_id homeroom,s.name subject,u.full_name teacher FROM lessons l JOIN classes cl ON cl.id=l.class_id JOIN subjects s ON s.id=l.subject_id JOIN users u ON u.id=l.teacher_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
                 if not l or u['role'] not in ('admin','teacher') or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): out=layout('403','<div class=card><h1>403</h1></div>',u)
@@ -1538,6 +1560,24 @@ class Handler(BaseHTTPRequestHandler):
                     if old and not status: c.execute('DELETE FROM attendance WHERE id=?',(old['id'],))
                     elif old: c.execute('UPDATE attendance SET status=?,comment=? WHERE id=?',(status,comment,old['id']))
                     elif status: c.execute('INSERT INTO attendance(student_id,date,status,subject_id,lesson_id,comment) VALUES(?,?,?,?,?,?)',(st['id'],day,status,l['subject_id'],lid,comment))
+            elif path.startswith('/lesson/') and '/grade-column/' in path and path.endswith('/edit') and u['role'] in ('admin','teacher'):
+                parts=path.strip('/').split('/'); lid=int(parts[1]); colid=int(parts[3])
+                l=one(c,'SELECT l.*,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                col=one(c,'SELECT * FROM grade_columns WHERE id=? AND class_id=? AND subject_id=?',(colid,l['class_id'],l['subject_id'])) if l else None
+                if not l or not col or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień.')
+                color=data.get('color','black')
+                if color not in ('red','green','blue','black','purple'): color='black'
+                category=data.get('category','Inne').strip(); name=data.get('name','').strip()
+                if not name: raise ValueError('Nazwa kolumny jest wymagana.')
+                weight=float(data.get('weight','1') or 1)
+                c.execute('UPDATE grade_columns SET category=?,name=?,weight=?,color=? WHERE id=?',(category,name,weight,color,colid))
+                c.execute('UPDATE grades SET weight=?,category=?,color=? WHERE column_id=?',(weight,category+' – '+name,color,colid))
+            elif path.startswith('/lesson/') and '/grade-column/' in path and path.endswith('/delete') and u['role'] in ('admin','teacher'):
+                parts=path.strip('/').split('/'); lid=int(parts[1]); colid=int(parts[3])
+                l=one(c,'SELECT l.*,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
+                col=one(c,'SELECT * FROM grade_columns WHERE id=? AND class_id=? AND subject_id=?',(colid,l['class_id'],l['subject_id'])) if l else None
+                if not l or not col or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień.')
+                c.execute('DELETE FROM grades WHERE column_id=?',(colid,)); c.execute('DELETE FROM grade_columns WHERE id=?',(colid,))
             elif path.startswith('/lesson/') and path.endswith('/grade-column') and u['role'] in ('admin','teacher'):
                 lid=int(path.split('/')[2]); l=one(c,'SELECT l.*,cl.school_id,cl.teacher_id homeroom FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
                 if not l or (u['role']=='teacher' and l['teacher_id']!=u['id'] and l['homeroom']!=u['id']): raise ValueError('Brak uprawnień.')
@@ -1654,7 +1694,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith('/attendance'): target='/attendance'
         elif path.startswith('/lesson/'):
             target='/lesson/'+path.split('/')[2]
-            if path.endswith('/grade-column') or path.endswith('/gradebook'): target += '/grades'
+            if path.endswith('/grade-column') or path.endswith('/gradebook') or '/grade-column/' in path: target += '/grades'
             if data.get('date'): target += '?date='+data.get('date')
         elif path=='/it/school/select': target='/dashboard'
         elif path=='/it/school/create': target='/it/schools'
