@@ -661,7 +661,7 @@ def schedule_page(u,c,selected_class_id=None,selected_week=None):
             current_end=max(current_end,en)
         if current: groups.append(current)
 
-        layout={}
+        event_layout={}
         for group in groups:
             lane_ends=[]
             assigned=[]
@@ -678,12 +678,12 @@ def schedule_page(u,c,selected_class_id=None,selected_week=None):
                 assigned.append((x,lane))
             lane_count=max(1,len(lane_ends))
             for x,lane in assigned:
-                layout[x['id']]=(lane,lane_count)
+                event_layout[x['id']]=(lane,lane_count)
 
         for x in matches:
             top=max(0,int((minutes(x['start_time'])-start_min)*px_per_min))
             height=max(96,int((minutes(x['end_time'])-minutes(x['start_time']))*px_per_min)-6)
-            lane,lane_count=layout.get(x['id'],(0,1))
+            lane,lane_count=event_layout.get(x['id'],(0,1))
             left=lane*100.0/lane_count
             width=100.0/lane_count
             pos=f"left:calc({left:.6f}% + 5px);width:calc({width:.6f}% - 10px);right:auto"
