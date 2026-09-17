@@ -645,11 +645,49 @@ def schedule_page(u,c,selected_class_id=None,selected_week=None):
     columns=[]
     for i,day in enumerate(week_days,1):
         events=[]
-        matches=[x for x in lessons if int(x['weekday'])==i and lesson_occurs_on(x,day)]
+        matches=sorted([x for x in lessons if int(x['weekday'])==i and lesson_occurs_on(x,day)], key=lambda x:(minutes(x['start_time']),minutes(x['end_time']),x['id']))
+
+        # Lekcje odbywające się w tym samym czasie dzielą szerokość kolumny dnia.
+        # Np. dwie równoległe lekcje dostają po 50%, trzy po 33.33%.
+        # Lekcje stykające się godziną (koniec jednej = początek drugiej) nie są traktowane jako nakładające się.
+        groups=[]
+        current=[]
+        current_end=-1
+        for x in matches:
+            st,en=minutes(x['start_time']),minutes(x['end_time'])
+            if current and st>=current_end:
+                groups.append(current); current=[]; current_end=-1
+            current.append(x)
+            current_end=max(current_end,en)
+        if current: groups.append(current)
+
+        layout={}
+        for group in groups:
+            lane_ends=[]
+            assigned=[]
+            for x in group:
+                st,en=minutes(x['start_time']),minutes(x['end_time'])
+                lane=None
+                for idx,lane_end in enumerate(lane_ends):
+                    if st>=lane_end:
+                        lane=idx; break
+                if lane is None:
+                    lane=len(lane_ends); lane_ends.append(en)
+                else:
+                    lane_ends[lane]=en
+                assigned.append((x,lane))
+            lane_count=max(1,len(lane_ends))
+            for x,lane in assigned:
+                layout[x['id']]=(lane,lane_count)
+
         for x in matches:
             top=max(0,int((minutes(x['start_time'])-start_min)*px_per_min))
             height=max(96,int((minutes(x['end_time'])-minutes(x['start_time']))*px_per_min)-6)
-            events.append(f"<div class='timeline-event' style='top:{top}px;height:{height}px'>{lesson_card(x,u,c,day)}</div>")
+            lane,lane_count=layout.get(x['id'],(0,1))
+            left=lane*100.0/lane_count
+            width=100.0/lane_count
+            pos=f"left:calc({left:.6f}% + 5px);width:calc({width:.6f}% - 10px);right:auto"
+            events.append(f"<div class='timeline-event' style='top:{top}px;height:{height}px;{pos}'>{lesson_card(x,u,c,day)}</div>")
         columns.append(f"<div class='timeline-day' style='height:{grid_h}px'>{''.join(events)}</div>")
     timeline=("<div class='timeline-scroll'><div class='timeline-board'>"
               "<div class='timeline-corner'>Godzina</div>"+day_heads+
