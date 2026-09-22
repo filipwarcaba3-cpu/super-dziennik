@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Super dziennik 4.25 - zastępstwa i usuwanie pojedynczych lekcji przez administratora."""
+"""Super dziennik 4.25.1 - zastępstwa z opcją Inne."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from http import cookies
@@ -608,7 +608,7 @@ def lesson_card(x,u,c,day=None):
     attendance_warning="<span class='attendance-alert-corner' title='Nie sprawdzona obecność'>!</span>" if u['role'] in ('teacher','admin') and not cancelled and not lesson_attendance_complete(c,x,day) else ''
     meta=('<span>LEKCJA ODWOŁANA</span>' if cancelled and not sub else (f"<span>{esc(topic)}</span>" if topic else '<span>Brak tematu</span>')) + planned_html
     subcls=' lesson-substitution' if sub else ''
-    sublabel="<span class='substitution-label'>ZASTĘPSTWO</span>" if sub else ''
+    sublabel=''  # Na planie zastępstwo rozpoznajemy po czerwonej ramce, bez etykiety tekstowej.
     return f"<a class='lesson {color}{subcls}' href='/lesson/{x['id']}?date={day.isoformat()}'>{attendance_warning}{sublabel}<b>{subject}</b><br>{cls if u['role']!='student' else teacher}<br>s. {room}<small>{meta}</small></a>"
 
 def schedule_page(u,c,selected_class_id=None,selected_week=None):
@@ -791,7 +791,9 @@ def substitution_page(u,c,l,day):
     subjects=q(c,'SELECT id,name FROM subjects WHERE school_id=? ORDER BY name',(u['school_id'],))
     teachers=q(c,"SELECT id,full_name FROM users WHERE role='teacher' AND school_id=? AND active=1 ORDER BY full_name",(u['school_id'],))
     sub=lesson_substitution(c,l['id'],day)
-    body=f"""<div class=hero><div><h1>Wybierz lekcję zastępczą</h1><div class=muted>{esc(l['class_name'])} · {day.strftime('%d.%m.%Y')} · {esc(l['start_time'])}–{esc(l['end_time'])}</div></div></div><div class='card substitution-editor'><h3>Zastępstwo za: {esc(l['subject'])}</h3><form class=form method=post action='/lesson/{l['id']}/substitution'><input type=hidden name=date value='{day.isoformat()}'><label>Przedmiot zastępczy<select name=subject_id required>{opts(subjects,'id','name',sub['subject_id'] if sub else l['subject_id'])}</select></label><label>Nauczyciel zastępujący<select name=teacher_id required>{opts(teachers,'id','full_name',sub['teacher_id'] if sub else None)}</select></label><label>Sala<input name=room value='{esc(row_get(sub,'room',l['room']) if sub else l['room'])}' placeholder='Sala'></label><div class=row><button class='btn red'>Zapisz zastępstwo</button><a class='btn gray' href='/lesson/{l['id']}?date={day.isoformat()}'>Anuluj</a></div></form></div>"""
+    selected_subject=(sub['subject_id'] if sub else l['subject_id'])
+    subject_options=opts(subjects,'id','name',selected_subject)+"<option value='__other__'>Inne</option>"
+    body=f"""<div class=hero><div><h1>Wybierz lekcję zastępczą</h1><div class=muted>{esc(l['class_name'])} · {day.strftime('%d.%m.%Y')} · {esc(l['start_time'])}–{esc(l['end_time'])}</div></div></div><div class='card substitution-editor'><h3>Zastępstwo za: {esc(l['subject'])}</h3><form class=form method=post action='/lesson/{l['id']}/substitution'><input type=hidden name=date value='{day.isoformat()}'><label>Przedmiot zastępczy<select name=subject_id id=substitutionSubject required onchange="document.getElementById('substitutionOtherSubject').style.display=this.value==='__other__'?'block':'none'">{subject_options}</select></label><div id=substitutionOtherSubject style='display:none'><label>Nazwa<input name=other_subject_name placeholder='Wpisz nazwę lekcji / wydarzenia'></label></div><label>Nauczyciel zastępujący<select name=teacher_id required>{opts(teachers,'id','full_name',sub['teacher_id'] if sub else None)}</select></label><label>Sala<input name=room value='{esc(row_get(sub,'room',l['room']) if sub else l['room'])}' placeholder='Sala'></label><div class=row><button class='btn red'>Zapisz zastępstwo</button><a class='btn gray' href='/lesson/{l['id']}?date={day.isoformat()}'>Anuluj</a></div></form></div>"""
     return layout('Wybierz lekcję zastępczą',body,u,'/schedule')
 
 def lesson_note_page(u,c,l,day):
@@ -1762,9 +1764,18 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('DELETE FROM lesson_substitutions WHERE lesson_id=? AND date=?',(lid,day))
                 c.execute('DELETE FROM lesson_cancellations WHERE lesson_id=? AND date=?',(lid,day))
             elif path.startswith('/lesson/') and path.endswith('/substitution') and u['role']=='admin':
-                lid=int(path.split('/')[2]); day=data.get('date','').strip(); subject_id=int(data['subject_id']); teacher_id=int(data['teacher_id'])
+                lid=int(path.split('/')[2]); day=data.get('date','').strip(); teacher_id=int(data['teacher_id'])
                 l=one(c,'SELECT l.id FROM lessons l JOIN classes cl ON cl.id=l.class_id WHERE l.id=? AND cl.school_id=?',(lid,u['school_id']))
                 if not l: raise ValueError('Nie znaleziono lekcji.')
+                subject_raw=data.get('subject_id','').strip()
+                if subject_raw=='__other__':
+                    custom_name=data.get('other_subject_name','').strip()
+                    if not custom_name: raise ValueError('Po wybraniu „Inne” wpisz nazwę lekcji / wydarzenia.')
+                    existing=one(c,'SELECT id FROM subjects WHERE school_id=? AND LOWER(name)=LOWER(?)',(u['school_id'],custom_name))
+                    if existing: subject_id=int(existing['id'])
+                    else: subject_id=insert_id(c,'INSERT INTO subjects(school_id,name,short_name) VALUES(?,?,?)',(u['school_id'],custom_name,custom_name[:12]))
+                else:
+                    subject_id=int(subject_raw)
                 if not one(c,'SELECT id FROM subjects WHERE id=? AND school_id=?',(subject_id,u['school_id'])): raise ValueError('Nieprawidłowy przedmiot.')
                 if not one(c,"SELECT id FROM users WHERE id=? AND role='teacher' AND school_id=?",(teacher_id,u['school_id'])): raise ValueError('Nieprawidłowy nauczyciel.')
                 c.execute('INSERT INTO lesson_substitutions(lesson_id,date,subject_id,teacher_id,room,created_by) VALUES(?,?,?,?,?,?) ON CONFLICT(lesson_id,date) DO UPDATE SET subject_id=excluded.subject_id,teacher_id=excluded.teacher_id,room=excluded.room,created_by=excluded.created_by',(lid,day,subject_id,teacher_id,data.get('room',''),u['id']))
